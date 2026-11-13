@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>نظام طلبات العملاء</title>
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%231d4ed8'/><path d='M9 10h14M9 16h14M9 22h9' stroke='white' stroke-width='3' stroke-linecap='round'/></svg>">
+</head>
+<body>
+<aside class="sidebar">
+  <div class="brand">
+    <div class="logo">📦</div>
+    <div><strong>نظام الطلبات</strong><small id="todayLabel"></small></div>
+  </div>
+  <nav>
+    <a href="#/" data-nav="dashboard"><span>🏠</span>لوحة التحكم</a>
+    <a href="#/orders/new" data-nav="new" class="nav-primary"><span>＋</span>طلب جديد</a>
+    <a href="#/orders" data-nav="orders"><span>📋</span>كل الطلبات</a>
+    <a href="#/late" data-nav="late"><span>⏰</span>الطلبات المتأخرة <b class="badge" id="lateBadge" hidden></b></a>
+    <a href="#/customers" data-nav="customers"><span>👥</span>العملاء</a>
+    <a href="#/reports" data-nav="reports"><span>📊</span>تقرير العملاء</a>
+    <a href="#/settings" data-nav="settings"><span>⚙️</span>النسخ الاحتياطي</a>
+  </nav>
+</aside>
+<main id="app"><div class="loading">جاري التحميل…</div></main>
+
+<dialog id="modal"><form method="dialog" id="modalForm"></form></dialog>
+<div id="toast" role="status"></div>
+<script src="app.js"></script>
+</body>
+</html>
