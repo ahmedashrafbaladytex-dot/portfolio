@@ -3,12 +3,23 @@
 process.removeAllListeners('warning');
 process.on('warning', w => { if (w.name !== 'ExperimentalWarning') console.warn(w); });
 
+// لازم Node.js 22.13 أو أحدث عشان قاعدة البيانات المدمجة (node:sqlite)
+{
+  const [maj, min] = process.versions.node.split('.').map(Number);
+  if (maj < 22 || (maj === 22 && min < 13)) {
+    console.error(`\n  نسخة Node.js عندك قديمة (${process.version}).`);
+    console.error('  Your Node.js is too old. Install the LTS version from https://nodejs.org (22.13 or newer).\n');
+    process.exit(1);
+  }
+}
+
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
+const { exec } = require('node:child_process');
 
 const PORT = Number(process.env.PORT) || 3000;
 const PASSWORD = process.env.APP_PASSWORD || '';
@@ -370,7 +381,8 @@ const server = http.createServer(async (req, res) => {
   if (!authorized(req)) return send(res, 401, 'مطلوب كلمة المرور', 'text/plain; charset=utf-8', { 'WWW-Authenticate': 'Basic realm="Orders", charset="UTF-8"' });
   try {
     if (url.pathname.startsWith('/api/')) return await api(req, res, url);
-    let rel = decodeURIComponent(url.pathname);
+    let rel;
+    try { rel = decodeURIComponent(url.pathname); } catch { return send(res, 400, 'Bad request', 'text/plain'); }
     if (rel === '/') rel = '/index.html';
     const file = path.normalize(path.join(PUBLIC_DIR, rel));
     if (!file.startsWith(PUBLIC_DIR + path.sep) || !fs.existsSync(file) || !fs.statSync(file).isFile()) return send(res, 404, 'Not found', 'text/plain');
@@ -381,6 +393,23 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+// يفتح المتصفح تلقائي لما السيرفر يجهز (بيتفعّل من start-windows.bat)
+function openBrowser() {
+  if (process.env.OPEN_BROWSER !== '1') return;
+  const url = `http://localhost:${PORT}`;
+  const cmd = process.platform === 'win32' ? `start "" "${url}"` : process.platform === 'darwin' ? `open "${url}"` : `xdg-open "${url}"`;
+  exec(cmd, () => {});
+}
+
+server.on('error', e => {
+  if (e.code === 'EADDRINUSE') {
+    console.error(`\n  السيستم شغال بالفعل (أو برنامج تاني ماسك البورت ${PORT}).`);
+    console.error(`  Port ${PORT} is already in use - the system is probably already running. Opening it in the browser.\n`);
+    openBrowser();
+  } else console.error(e);
+  process.exitCode = 1;
+});
+
 server.listen(PORT, '0.0.0.0', () => {
   const ips = Object.values(os.networkInterfaces()).flat().filter(i => i && i.family === 'IPv4' && !i.internal).map(i => i.address);
   console.log('\n  نظام طلبات العملاء شغال ✔');
@@ -388,7 +417,9 @@ server.listen(PORT, '0.0.0.0', () => {
   for (const ip of ips) console.log(`  من أي جهاز على الشبكة: http://${ip}:${PORT}`);
   console.log(`  قاعدة البيانات: ${DB_FILE}`);
   console.log(PASSWORD ? '  الحماية بكلمة مرور: مفعّلة' : '  تنبيه: مفيش كلمة مرور (APP_PASSWORD)');
+  console.log('  متقفلش الشباك ده طول ما السيستم شغال. Keep this window open while using the system.');
   console.log('');
+  openBrowser();
 });
 
 module.exports = { server, db };

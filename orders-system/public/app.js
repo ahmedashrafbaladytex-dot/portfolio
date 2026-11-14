@@ -5,14 +5,15 @@ const STATUS = { new: 'جديد', in_progress: 'قيد التنفيذ', ready: '
 const STATUS_COLOR = { new: '#1d4ed8', in_progress: '#d97706', ready: '#7c3aed', delivered: '#059669', cancelled: '#94a3b8' };
 const UNITS = ['قطعة', 'متر', 'كيلو', 'طقم', 'دستة', 'ثوب', 'رول', 'كرتونة'];
 const $app = document.getElementById('app');
-let TODAY = new Date().toISOString().slice(0, 10);
+const ymd = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+let TODAY = ymd(new Date());
 
 // ---------- أدوات ----------
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const money = n => Number(n || 0).toLocaleString('en-US', { maximumFractionDigits: 2 });
 const qty = n => Number(n || 0).toLocaleString('en-US', { maximumFractionDigits: 3 });
 const fmtDate = d => d ? new Date(d + 'T00:00:00').toLocaleDateString('ar-EG-u-nu-latn', { year: 'numeric', month: 'short', day: 'numeric' }) : '—';
-const addDays = (d, n) => { const x = new Date(d + 'T00:00:00'); x.setDate(x.getDate() + n); return x.toISOString().slice(0, 10); };
+const addDays = (d, n) => { const x = new Date(d + 'T00:00:00'); x.setDate(x.getDate() + n); return ymd(x); };
 
 async function api(path, opts = {}) {
   const res = await fetch('/api/' + path, {
