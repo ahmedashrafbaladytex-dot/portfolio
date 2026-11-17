@@ -56,6 +56,14 @@ Excel أو CSV${ai.enabled() ? ' أو صورة الفاتورة' : ''} — وأ�
 
 وكل يوم الساعة ${cfg.dailyTime} هبعتلكم تقرير اليوم، وكل ${['أحد', 'اتنين', 'تلات', 'أربع', 'خميس', 'جمعة', 'سبت'][cfg.weeklyDay]} التقرير الكامل.`;
 
+// يفتح رابط في المتصفح/تليجرام على جهاز المستخدم
+function openUrl(url) {
+  if (process.env.NO_BROWSER) return;
+  const { exec } = require('node:child_process');
+  const cmd = process.platform === 'win32' ? `start "" "${url}"` : process.platform === 'darwin' ? `open "${url}"` : `xdg-open "${url}"`;
+  exec(cmd, () => {});
+}
+
 // ---------- أول تشغيل: معالج بسيط ----------
 async function setupWizard() {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -65,10 +73,13 @@ async function setupWizard() {
      أهلاً! خلينا نجهّز البوت (مرة واحدة بس)
   ===============================================
 
-  1. افتح تليجرام وابحث عن  @BotFather
-  2. ابعتله  /newbot  واختار اسم للبوت
-  3. هيبعتلك "توكن" شبه كده:  123456789:AAH...
+  فتحتلك @BotFather في تليجرام. اعمل كده:
+  1. دوس  Start  وبعدين ابعتله  /newbot
+  2. اكتب اسم للبوت (مثلاً: مبيعات المصنع)
+  3. اكتب اسم إنجليزي ينتهي بـ bot (مثلاً: myfactory_sales_bot)
+  4. هيبعتلك "توكن" شبه كده:  123456789:AAH...  انسخه
 `);
+  openUrl('https://t.me/BotFather');
   for (;;) {
     const token = await ask('  الصق التوكن هنا (كليك يمين = لصق) واضغط Enter:  ');
     try {
@@ -313,7 +324,7 @@ async function onMessage(msg) {
     if (msg.new_chat_members?.some(u => u.id === me.id)) {
       return send(chatId, '👋 أهلاً! عشان أشتغل هنا:\n1. خليني <b>أدمن</b> في الجروب\n2. ابعت <b>كود الربط</b> اللي ظاهر على شاشة الجهاز اللي شغّال عليه البوت');
     }
-    if (norm(text).replace(/^\/start\s*/, '').trim() === LINK_CODE) return linkChat(chatId, msg.chat.title);
+    if (text.replace(/^\/start(@\S+)?\s*/, '').trim() === LINK_CODE) return linkChat(chatId, msg.chat.title);
     if (msg.text?.startsWith('/') || msg.document || msg.photo) {
       await send(chatId, '🔒 ابعت كود الربط اللي ظاهر على شاشة الجهاز اللي شغّال عليه البوت.');
     }
@@ -370,14 +381,18 @@ async function main() {
 
   console.log(`\n  ✅ البوت شغال: @${me.username}   —   سيب الشباك ده مفتوح`);
   console.log(`  الذكاء الاصطناعي: ${ai.enabled() ? 'شغال' : 'مش متفعّل'}`);
+  const linkUrl = `https://t.me/${me.username}?startgroup=${LINK_CODE}&admin=pin_messages`;
   console.log(`
-  ┌─────────────────────────────────────────────┐
-     عشان تربط جروب:
-     1. ضيف @${me.username} للجروب واعمله أدمن
-     2. ابعت في الجروب الكود ده:    ${LINK_CODE}
-  └─────────────────────────────────────────────┘
+  ┌──────────────────────────────────────────────────────┐
+     عشان تربط جروب الفواتير:
+     دوس على الرابط ده (أو هيتفتح لوحده) واختار الجروب
+     ${linkUrl}
+
+     أو: ضيف @${me.username} للجروب واعمله أدمن، وابعت الكود:  ${LINK_CODE}
+  └──────────────────────────────────────────────────────┘
   ${cfg.allowedChats.length ? `(مربوط حالياً بـ ${cfg.allowedChats.length} جروب)` : ''}
 `);
+  if (!cfg.allowedChats.length) openUrl(linkUrl);
 
   setInterval(() => scheduler().catch(e => console.error('scheduler:', e.message)), 60000);
   setInterval(() => { for (const [k, v] of pending) if (Date.now() - v.at > 86400000) pending.delete(k); }, 3600000);
