@@ -136,3 +136,15 @@ test('ربط نظام طلبات العملاء', () => {
   assert.strictEqual(l[0].type, 'order');
   assert.strictEqual(l[0].customer, 'معرض النور');
 });
+
+test('البوت بيعرف نوع الملف من محتواه', () => {
+  const g = csv => parseFile(Buffer.from(csv), 'file.csv').guess;
+  assert.strictEqual(g('رقم,الصنف,الكمية,السعر,سبب المرتجع\n1,فوطة,2,10,عيب\n'), 'return');
+  assert.strictEqual(g('كود الصنف,اسم الصنف,الرصيد\nA,فوطة,20\n'), 'stock');
+  assert.strictEqual(g('كود الصنف,اسم الصنف,الخامة,اللون\nA,فوطة,قطن,أبيض\n'), 'items');
+  assert.strictEqual(g('فاتورة مرتجع\nرقم,الصنف,الكمية,السعر\n1,فوطة,2,10\n'), 'return');
+  assert.strictEqual(g('طلبية عميل\nرقم,الصنف,الكمية,السعر\n1,فوطة,2,10\n'), 'order');
+  assert.strictEqual(g('رقم الفاتورة,العميل,الصنف,الكمية,السعر\n1,أ,فوطة,2,10\n'), null); // مبيعات ولا طلبية؟ يسأل
+  const xl = writeXlsx([{ name: 'مبيعات نوفمبر', rows: [['رقم الفاتورة', 'الصنف', 'الكمية', 'السعر'], ['1', 'فوطة', 2, 10]] }]);
+  assert.strictEqual(parseFile(xl, 'x.xlsx').guess, 'sale');
+});

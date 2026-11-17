@@ -11,8 +11,10 @@ process.on('warning', w => { if (w.name !== 'ExperimentalWarning') console.warn(
   }
 }
 
+const fs = require('node:fs');
 const crypto = require('node:crypto');
-const { loadSettings, config, run } = require('./src/engine');
+const readline = require('node:readline');
+const { loadSettings, saveSetting, config, run } = require('./src/engine');
 loadSettings();
 const cfg = config();
 const store = require('./src/db').open(cfg.dataDir);
@@ -24,249 +26,307 @@ const R = require('./src/reports');
 const ai = require('./src/ai');
 const { templates } = require('./src/templates');
 
-if (!cfg.token) {
-  console.error('\n  مفيش TELEGRAM_BOT_TOKEN. افتح ملف settings.env وحط توكن البوت (من @BotFather).\n');
-  process.exit(1);
+let bot;
+let me;
+const pending = new Map();                                   // ملفات مستنية المستخدم يحدد نوعها
+const LINK_CODE = String(crypto.randomInt(1000, 10000));     // كود ربط الجروب (بيظهر على شاشة الجهاز بس)
+
+// ---------- القائمة (زراير ثابتة تحت الشات) ----------
+const B = {
+  today: '📊 تقرير النهارده', plan: '🏭 خطة الإنتاج', items: '🏆 الأصناف', returns: '↩️ المرتجعات',
+  taste: '🎨 ذوق السوق والموديلات', full: '📁 التقرير الكامل', help: '❓ إزاي أستخدمه',
+};
+const MENU = { keyboard: [[B.today, B.plan], [B.items, B.returns], [B.taste, B.full], [B.help]], resize_keyboard: true, is_persistent: true };
+
+const HELP = () => `🤖 <b>إزاي تستخدمني</b>
+
+<b>1) ابعتلي الملفات هنا</b>
+Excel أو CSV${ai.enabled() ? ' أو صورة الفاتورة' : ''} — وأنا أفهم لوحدي هو مبيعات ولا مرتجع ولا طلبية. لو مش متأكد هسألك بزرار.
+(لو عايز تحدد بنفسك اكتب في الكابشن: مبيعات / مرتجع / طلبية / مخزون)
+
+<b>2) دوس على الزراير اللي تحت</b>
+📊 تقرير النهارده — 🏭 خطة الإنتاج — 🏆 الأصناف
+↩️ المرتجعات — 🎨 ذوق السوق والموديلات — 📁 التقرير الكامل
+
+<b>3) دوّر على صنف</b>
+اكتب: <code>صنف ساتان بيج</code>${ai.enabled() ? `\n\n<b>4) اسأل أي سؤال</b>\nاكتب: <code>سؤال أنتج إيه للعيد؟</code>` : ''}
+
+↩️ بعت ملف غلط؟ اكتب <code>الغي</code>
+📎 عايز نموذج ملف جاهز؟ اكتب <code>نماذج</code>
+
+وكل يوم الساعة ${cfg.dailyTime} هبعتلكم تقرير اليوم، وكل ${['أحد', 'اتنين', 'تلات', 'أربع', 'خميس', 'جمعة', 'سبت'][cfg.weeklyDay]} التقرير الكامل.`;
+
+// ---------- أول تشغيل: معالج بسيط ----------
+async function setupWizard() {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const ask = q => new Promise(r => rl.question(q, a => r(a.trim())));
+  console.log(`
+  ===============================================
+     أهلاً! خلينا نجهّز البوت (مرة واحدة بس)
+  ===============================================
+
+  1. افتح تليجرام وابحث عن  @BotFather
+  2. ابعتله  /newbot  واختار اسم للبوت
+  3. هيبعتلك "توكن" شبه كده:  123456789:AAH...
+`);
+  for (;;) {
+    const token = await ask('  الصق التوكن هنا (كليك يمين = لصق) واضغط Enter:  ');
+    try {
+      const b = createBot(token);
+      const info = await b.api('getMe');
+      saveSetting('TELEGRAM_BOT_TOKEN', token);
+      cfg.token = token;
+      console.log(`\n  ✅ تمام! البوت بتاعك: @${info.username}\n`);
+      break;
+    } catch {
+      console.log('  ❌ التوكن ده مش شغال أو مفيش إنترنت — جرّب تاني.\n');
+    }
+  }
+  if (!ai.enabled()) {
+    console.log('  (اختياري) مفتاح Claude بيخلي البوت يقرا صور الفواتير ويكتب تحليل استراتيجي.');
+    const key = await ask('  الصق المفتاح أو اضغط Enter للتخطي:  ');
+    if (key) saveSetting('ANTHROPIC_API_KEY', key);
+  }
+  rl.close();
 }
-const bot = createBot(cfg.token);
-const pending = new Map(); // ملفات مستنية المستخدم يحدد نوعها
-
-const HELP = `🤖 <b>بوت ذكاء المبيعات</b>
-
-<b>ابعت على الجروب:</b>
-• ملف Excel أو CSV، أو صورة/PDF لفاتورة (الصور محتاجة تفعيل Claude)
-• اكتب في الكابشن نوعه: <code>#مبيعات</code> أو <code>#مرتجع</code> أو <code>#طلبية</code>
-• <code>#مخزون</code> لملف الجرد/الأرصدة، و <code>#أصناف</code> لملف بيانات الأصناف (فئة/خامة/لون/نقشة/مقاس)
-• لو نسيت الكابشن البوت هيسألك بزراير
-
-<b>الأوامر:</b>
-/today — تقرير النهارده
-/report — ملخص الفترة وتصنيف الأصناف
-/top — أقوى وأضعف الأصناف
-/returns — تحليل المرتجعات وأسبابها
-/taste — ذوق السوق (خامات، ألوان، نقشات، مقاسات، أسعار)
-/models — موديلات جديدة مقترحة
-/forecast — توقع الطلب وخطة الإنتاج والمخزون
-/item كود أو اسم — كارت صنف كامل
-/dashboard — لوحة تفاعلية (افتحها في المتصفح)
-/excel — ملف Excel بكل التحليلات
-/insights — تقرير استراتيجي بالذكاء الاصطناعي
-/ask سؤالك — اسأل عن أي حاجة في البيانات
-/enrich — استنتاج خصائص الأصناف الناقصة بالذكاء الاصطناعي
-/templates — نماذج ملفات جاهزة
-/undo — إلغاء آخر مستند اتبعت
-/status — حالة البيانات`;
 
 // ---------- استقبال المستندات ----------
 async function ingest(chatId, parsed, type, meta) {
   if (type === 'stock') {
     const asOf = toDate(parsed.meta?.date) || today();
     const n = store.saveStock(parsed.lines, asOf);
-    return `📦 اتسجل جرد المخزون: ${n} صنف (بتاريخ ${asOf}). البوت هيخصم المبيعات اللي بعد التاريخ ده تلقائي.`;
+    return `📦 اتسجل جرد المخزون: ${n} صنف (بتاريخ ${asOf}).`;
   }
   if (type === 'items') {
     const n = store.saveItems(parsed.lines);
-    return `🧵 اتحدثت بيانات ${n} صنف. الخصائص دي هتستخدم في تحليل ذوق السوق.`;
+    return `🧵 اتحدثت بيانات ${n} صنف.`;
   }
   const docs = groupDocs(parsed.lines, parsed.meta);
-  const out = [];
-  let total = 0, replaced = 0;
+  let total = 0, replaced = 0, first;
   for (const d of docs) {
     const r = store.saveDoc({ ...d, type, source: meta.source, file_name: meta.fileName, chat_id: chatId });
     total += r.total; if (r.replaced) replaced++;
-    out.push(r);
+    first = first || r;
   }
-  const head = `✅ اتسجل ${docs.length > 1 ? `${docs.length} ` : ''}${TYPE_AR[type]}${docs.length > 1 ? '' : ` رقم <code>${esc(out[0].doc_no)}</code>`}`;
-  const L = [head];
-  if (docs.length === 1) {
-    L.push(`📅 ${docs[0].doc_date}${docs[0].customer ? ` — 👤 ${esc(docs[0].customer)}` : ''}`);
-  } else {
-    const dates = docs.map(d => d.doc_date).sort();
-    L.push(`📅 من ${dates[0]} لـ ${dates[dates.length - 1]}`);
-  }
-  L.push(`🧾 ${parsed.lines.length} سطر — الإجمالي ${R.money(total)}`);
-  if (replaced) L.push(`♻️ ${replaced} مستند كان متسجل قبل كده واتحدّث`);
-  if (meta.ai) L.push('🤖 اتقرى بالذكاء الاصطناعي — راجع الأرقام، ولو في غلط ابعت /undo');
+  const L = [docs.length > 1
+    ? `✅ اتسجل ${docs.length} ${TYPE_AR[type]}`
+    : `✅ اتسجل ${TYPE_AR[type]} رقم <code>${esc(first.doc_no)}</code>${docs[0].customer ? ` — ${esc(docs[0].customer)}` : ''}`];
+  L.push(`🧾 ${parsed.lines.length} صنف — ${R.money(total)}`);
+  if (replaced) L.push(`♻️ ${replaced} كان متسجل قبل كده واتحدّث`);
+  if (meta.ai) L.push('🤖 اتقرى من الصورة — لو في غلط اكتب «الغي»');
   if (parsed.columns && !parsed.columns.includes('qty')) L.push('⚠️ مالقيتش عمود الكمية');
+  autoEnrich();
   return L.join('\n');
 }
+
+// يكمّل خصائص الأصناف الجديدة (فئة/خامة/لون/نقشة) في الخلفية من غير ما حد يطلب
+let enriching = false;
+function autoEnrich() {
+  if (!ai.enabled() || enriching) return;
+  const missing = store.needEnrich();
+  if (!missing.length) return;
+  enriching = true;
+  const items = store.items();
+  const vocab = {};
+  for (const k of ['category', 'fabric', 'color', 'pattern', 'size']) vocab[k] = [...new Set(items.map(i => i[k]).filter(Boolean))].slice(0, 40);
+  ai.classifyItems(missing, vocab).then(res => {
+    const byCode = new Map(missing.map(i => [i.code, i]));
+    for (const r of res) {
+      const cur = byCode.get(r.code);
+      if (!cur) continue;
+      const upd = {};
+      for (const k of ['category', 'fabric', 'color', 'pattern', 'size']) if (!cur[k] && r[k]) upd[k] = r[k];
+      store.updateItemAttrs(r.code, upd, 'ai');
+    }
+    store.markTried(missing.map(i => i.code));
+  }).catch(e => console.warn('تصنيف الأصناف:', e.message)).finally(() => { enriching = false; });
+}
+
+const TYPE_BUTTONS = id => ({ inline_keyboard: [
+  [{ text: '💰 مبيعات', callback_data: `t:${id}:sale` }, { text: '↩️ مرتجع', callback_data: `t:${id}:return` }, { text: '📝 طلبية', callback_data: `t:${id}:order` }],
+  [{ text: '📦 جرد مخزون', callback_data: `t:${id}:stock` }, { text: '🧵 بيانات أصناف', callback_data: `t:${id}:items` }, { text: '❌ تجاهل', callback_data: `t:${id}:skip` }],
+] });
 
 async function handleFile(msg, fileId, fileName, mime) {
   const chatId = msg.chat.id;
   const caption = msg.caption || '';
   let type = detectType(caption) || detectType(fileName);
-  const buf = await bot.download(fileId);
   const isImage = /^image\//.test(mime) || /\.(jpe?g|png|webp)$/i.test(fileName);
   const isPdf = mime === 'application/pdf' || /\.pdf$/i.test(fileName);
+  if ((isImage || isPdf) && !ai.enabled()) {
+    return bot.send(chatId, '📷 مش بقدر أقرا الصور غير لو مفتاح Claude متفعّل. ابعت الفاتورة Excel.', { reply_to_message_id: msg.message_id });
+  }
+  const buf = await bot.download(fileId);
   let parsed, viaAI = false;
   if (isImage || isPdf) {
-    if (!ai.enabled()) return bot.send(chatId, '📷 قراءة الصور والـ PDF محتاجة تفعيل Claude (ANTHROPIC_API_KEY في settings.env). ابعت الفاتورة Excel أو CSV.', { reply_to_message_id: msg.message_id });
     await bot.api('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
-    const mt = isPdf ? 'application/pdf' : (mime && mime.startsWith('image/') ? mime : 'image/jpeg');
-    const x = await ai.extractDocument({ buffer: buf, mime: mt, caption });
+    const x = await ai.extractDocument({ buffer: buf, mime: isPdf ? 'application/pdf' : (mime.startsWith('image/') ? mime : 'image/jpeg'), caption });
     if (!type && x.doc_type !== 'unknown') type = x.doc_type;
-    parsed = { lines: x.lines.map(l => ({ ...l, qty: Math.abs(l.qty ?? 0), price: l.price ?? (l.total && l.qty ? l.total / l.qty : 0), total: l.total ?? (l.qty ?? 0) * (l.price ?? 0) })), meta: { doc_no: x.doc_no, date: x.date, customer: x.customer } };
+    parsed = aiToParsed(x);
     viaAI = true;
   } else {
     parsed = parseFile(buf, fileName);
+    type = type || parsed.guess;
   }
   const meta = { source: viaAI ? 'ai' : 'file', fileName, ai: viaAI };
   if (!type) {
     const id = crypto.randomBytes(4).toString('hex');
     pending.set(id, { parsed, meta, chatId, at: Date.now() });
-    return bot.send(chatId, `📄 استلمت «${esc(fileName)}» (${parsed.lines.length} سطر). ده إيه؟`, {
-      reply_to_message_id: msg.message_id,
-      reply_markup: { inline_keyboard: [
-        [{ text: '💰 مبيعات', callback_data: `t:${id}:sale` }, { text: '↩️ مرتجع', callback_data: `t:${id}:return` }, { text: '📝 طلبية', callback_data: `t:${id}:order` }],
-        [{ text: '📦 جرد مخزون', callback_data: `t:${id}:stock` }, { text: '🧵 بيانات أصناف', callback_data: `t:${id}:items` }, { text: '❌ تجاهل', callback_data: `t:${id}:skip` }],
-      ] },
-    });
+    return bot.send(chatId, `📄 استلمت الملف (${parsed.lines.length} صنف). ده إيه؟`, { reply_to_message_id: msg.message_id, reply_markup: TYPE_BUTTONS(id) });
   }
   return bot.send(chatId, await ingest(chatId, parsed, type, meta), { reply_to_message_id: msg.message_id });
 }
+const aiToParsed = x => ({
+  lines: x.lines.map(l => ({ ...l, qty: Math.abs(l.qty ?? 0), price: l.price ?? (l.total && l.qty ? l.total / l.qty : 0), total: l.total ?? (l.qty ?? 0) * (l.price ?? 0) })),
+  meta: { doc_no: x.doc_no, date: x.date, customer: x.customer },
+});
 
-// ---------- الأوامر ----------
+// ---------- التقارير ----------
 const analysis = () => run(store, cfg);
-const sendLong = (chatId, text) => bot.send(chatId, text);
+const send = (c, t, extra) => bot.send(c, t, extra);
 
-async function dashboard(chatId, withAI = false) {
+async function fullReport(c) {
   const { analysis: a } = analysis();
+  await send(c, R.summaryMessage(a));
   let insights = '';
-  if (withAI && ai.enabled()) insights = await ai.strategicInsights(R.compactForAI(a)).catch(e => `تعذر التحليل: ${e.message}`);
-  await bot.sendDocument(chatId, Buffer.from(R.dashboardHtml(a, insights), 'utf8'), `dashboard-${a.summary.asOf}.html`, '📊 افتح الملف في المتصفح (كروم) — فيه كل التحليلات وبحث في الأصناف', 'text/html');
-  return insights;
+  if (ai.enabled()) {
+    await send(c, '🧠 بكتب التحليل الاستراتيجي... (دقيقة تقريباً)');
+    insights = await ai.strategicInsights(R.compactForAI(a)).catch(e => { console.warn(e.message); return ''; });
+  }
+  await bot.sendDocument(c, Buffer.from(R.dashboardHtml(a, insights), 'utf8'), `تقرير-${a.summary.asOf}.html`, '📊 <b>اللوحة الكاملة</b> — افتحها على الموبايل أو الكمبيوتر', 'text/html');
+  await bot.sendDocument(c, R.excelReport(a), `تحليل-${a.summary.asOf}.xlsx`, '📗 كل التحليلات في Excel', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  if (insights) await send(c, '🧠 <b>التحليل الاستراتيجي</b>\n\n' + esc(insights));
 }
 
-const COMMANDS = {
-  async start(c) { await bot.send(c, HELP); },
-  async help(c) { await bot.send(c, HELP); },
-  async today(c, arg) {
-    const d = toDate(arg) || today();
-    const r = analysis();
-    await sendLong(c, R.dailyMessage(r.period(d, d), r.analysis));
-  },
-  async week(c) {
-    const r = analysis(), d = today();
-    await sendLong(c, R.dailyMessage(r.period(addDays(d, -6), d), r.analysis).replace('التقرير اليومي', 'تقرير آخر 7 أيام'));
-  },
-  async report(c) { await sendLong(c, R.summaryMessage(analysis().analysis)); },
-  async top(c) { await sendLong(c, R.topMessage(analysis().analysis)); },
-  async returns(c) { await sendLong(c, R.returnsMessage(analysis().analysis)); },
-  async taste(c) { await sendLong(c, R.tasteMessage(analysis().analysis)); },
-  async models(c) { await sendLong(c, R.modelsMessage(analysis().analysis)); },
-  async forecast(c) { await sendLong(c, R.forecastMessage(analysis().analysis)); },
-  async plan(c) { await COMMANDS.forecast(c); },
-  async item(c, arg) {
-    if (!arg) return bot.send(c, 'اكتب الكود أو جزء من الاسم: <code>/item طقم ساتان</code>');
-    const a = analysis().analysis;
-    const q = norm(arg);
-    const found = a.items.find(i => norm(i.code) === q) || a.items.find(i => norm(i.name) === q)
-      || a.items.filter(i => norm(i.name).includes(q) || norm(i.code).includes(q));
-    if (Array.isArray(found)) {
-      if (found.length === 1) return sendLong(c, R.itemMessage(found[0], a));
-      if (!found.length) return bot.send(c, 'مالقيتش صنف بالاسم ده.');
-      return bot.send(c, `لقيت ${found.length} صنف، حدد أكتر:\n` + found.slice(0, 15).map(i => `• <code>/item ${esc(i.code)}</code> — ${esc(i.name)}`).join('\n'));
-    }
-    return sendLong(c, R.itemMessage(found, a));
-  },
-  async dashboard(c) { await dashboard(c, false); },
-  async excel(c) {
-    const a = analysis().analysis;
-    await bot.sendDocument(c, R.excelReport(a), `sales-intelligence-${a.summary.asOf}.xlsx`, '📗 كل التحليلات في Excel: الأصناف، خطة الإنتاج، ذوق السوق، الموديلات المقترحة، المرتجعات، العملاء', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-  },
-  async insights(c) {
-    if (!ai.enabled()) return bot.send(c, 'التقرير الاستراتيجي محتاج ANTHROPIC_API_KEY في settings.env');
-    await bot.send(c, '🧠 بحلل البيانات... (ممكن ياخد دقيقة)');
-    const insights = await dashboard(c, true);
-    if (insights) await sendLong(c, '🧠 <b>التحليل الاستراتيجي</b>\n\n' + esc(insights));
-  },
-  async ask(c, arg) {
-    if (!arg) return bot.send(c, 'اكتب سؤالك بعد الأمر: <code>/ask إيه أكتر لون بيرجع؟</code>');
-    if (!ai.enabled()) return bot.send(c, 'الأسئلة الحرة محتاجة ANTHROPIC_API_KEY في settings.env');
-    await bot.api('sendChatAction', { chat_id: c, action: 'typing' }).catch(() => {});
-    await sendLong(c, esc(await ai.ask(arg, R.compactForAI(analysis().analysis))));
-  },
-  async enrich(c) {
-    if (!ai.enabled()) return bot.send(c, 'محتاج ANTHROPIC_API_KEY في settings.env');
-    const items = store.items();
-    const missing = items.filter(i => i.attr_source !== 'file' && (!i.category || !i.fabric || !i.color || !i.pattern));
-    if (!missing.length) return bot.send(c, '✅ كل الأصناف خصائصها كاملة.');
-    await bot.send(c, `🧵 بصنّف ${missing.length} صنف...`);
-    const vocab = {};
-    for (const k of ['category', 'fabric', 'color', 'pattern', 'size']) vocab[k] = [...new Set(items.map(i => i[k]).filter(Boolean))].slice(0, 40);
-    const res = await ai.classifyItems(missing, vocab);
-    const byCode = new Map(missing.map(i => [i.code, i]));
-    let n = 0;
-    for (const r of res) {
-      const cur = byCode.get(r.code);
-      if (!cur) continue;
-      // متكتبش فوق قيمة موجودة
-      const upd = {};
-      for (const k of ['category', 'fabric', 'color', 'pattern', 'size']) if (!cur[k] && r[k]) upd[k] = r[k];
-      if (Object.keys(upd).length) { store.updateItemAttrs(r.code, upd, 'ai'); n++; }
-    }
-    await bot.send(c, `✅ اتحدثت خصائص ${n} صنف. جرّب /taste و /models`);
-  },
-  async templates(c) {
-    for (const t of templates()) await bot.sendDocument(c, t.buffer, t.name, t.caption, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-  },
-  async undo(c) {
-    const d = store.lastDoc(c);
-    if (!d) return bot.send(c, 'مفيش مستندات اتبعتت من الجروب ده.');
-    store.deleteDoc(d.id);
-    await bot.send(c, `🗑️ اتلغى ${TYPE_AR[d.type]} رقم <code>${esc(d.doc_no)}</code> (${d.doc_date})`);
-  },
-  async status(c) {
-    const counts = store.counts();
-    const L = ['📦 <b>حالة البيانات</b>'];
-    for (const t of ['sale', 'return', 'order']) {
-      const x = counts.find(r => r.type === t);
-      L.push(`• ${TYPE_AR[t]}: ${x ? `${fmt(x.n)} (${x.first} ← ${x.last})` : 'لا يوجد'}`);
-    }
-    const items = store.items(), stock = store.stock();
-    L.push(`• الأصناف: ${items.length} (خصائص كاملة: ${items.filter(i => i.category && i.color && i.fabric).length})`);
-    L.push(`• أرصدة مخزون: ${stock.length}`);
-    L.push(`• نظام الطلبات: ${cfg.ordersDb && require('node:fs').existsSync(cfg.ordersDb) ? 'مربوط ✅' : 'مش مربوط'}`);
-    L.push(`• الذكاء الاصطناعي (Claude): ${ai.enabled() ? 'مفعّل ✅' : 'مش مفعّل'}`);
-    L.push(`• التقرير اليومي الساعة ${cfg.dailyTime} — والأسبوعي يوم ${['الأحد', 'الاتنين', 'التلات', 'الأربع', 'الخميس', 'الجمعة', 'السبت'][cfg.weeklyDay]}`);
-    await bot.send(c, L.join('\n'));
-  },
-  async chatid(c) { await bot.send(c, `Chat ID: <code>${c}</code>`); },
+async function findItem(c, q) {
+  const a = analysis().analysis;
+  const n = norm(q);
+  const exact = a.items.find(i => norm(i.code) === n || norm(i.name) === n);
+  if (exact) return send(c, R.itemMessage(exact, a));
+  const words = n.split(' ');
+  const hits = a.items.filter(i => { const t = norm(i.name + ' ' + i.code); return words.every(w => t.includes(w)); });
+  if (hits.length === 1) return send(c, R.itemMessage(hits[0], a));
+  if (!hits.length) return send(c, 'مالقيتش صنف بالاسم ده.');
+  return send(c, `لقيت ${hits.length} صنف — اكتب اسم أدق:\n` + hits.slice(0, 15).map(i => `• ${esc(i.name)} <code>${esc(i.code)}</code>`).join('\n'));
+}
+
+async function undo(c) {
+  const d = store.lastDoc(c);
+  if (!d) return send(c, 'مفيش حاجة اتبعتت من هنا عشان ألغيها.');
+  store.deleteDoc(d.id);
+  return send(c, `🗑️ اتلغى ${TYPE_AR[d.type]} رقم <code>${esc(d.doc_no)}</code> (${d.doc_date})`);
+}
+
+async function status(c) {
+  const counts = store.counts();
+  const L = ['📦 <b>اللي عندي لحد دلوقتي</b>'];
+  for (const t of ['sale', 'return', 'order']) {
+    const x = counts.find(r => r.type === t);
+    L.push(`• ${TYPE_AR[t]}: ${x ? `${fmt(x.n)} (${x.first} ← ${x.last})` : 'لسه مفيش'}`);
+  }
+  L.push(`• الأصناف: ${store.items().length} — أرصدة مخزون: ${store.stock().length}`);
+  L.push(`• نظام طلبات العملاء: ${cfg.ordersDb && fs.existsSync(cfg.ordersDb) ? 'مربوط ✅' : 'مش مربوط'}`);
+  L.push(`• الذكاء الاصطناعي: ${ai.enabled() ? 'شغال ✅' : 'مش متفعّل'}`);
+  return send(c, L.join('\n'));
+}
+
+// زراير القائمة + كلمات بسيطة + الأوامر القديمة (للي متعود عليها)
+const ACTIONS = {
+  [B.today]: c => { const r = analysis(), d = today(); return send(c, R.dailyMessage(r.period(d, d), r.analysis)); },
+  [B.plan]: c => send(c, R.forecastMessage(analysis().analysis)),
+  [B.items]: c => send(c, R.topMessage(analysis().analysis)),
+  [B.returns]: c => send(c, R.returnsMessage(analysis().analysis)),
+  [B.taste]: async c => { const a = analysis().analysis; await send(c, R.tasteMessage(a)); await send(c, R.modelsMessage(a)); },
+  [B.full]: fullReport,
+  [B.help]: c => send(c, HELP(), { reply_markup: MENU }),
 };
+const SLASH = {
+  start: B.help, help: B.help, menu: B.help, today: B.today, forecast: B.plan, plan: B.plan, top: B.items, report: B.items,
+  returns: B.returns, taste: B.taste, models: B.taste, full: B.full, dashboard: B.full, excel: B.full, insights: B.full,
+};
+
+async function onText(chatId, text) {
+  const t = text.trim();
+  if (ACTIONS[t]) return ACTIONS[t](chatId);
+  const m = t.match(/^\/(\w+)(?:@\w+)?\s*([\s\S]*)$/);
+  if (m) {
+    const cmd = m[1].toLowerCase(), arg = m[2].trim();
+    if (SLASH[cmd]) return ACTIONS[SLASH[cmd]](chatId);
+    if (cmd === 'item') return arg ? findItem(chatId, arg) : send(chatId, 'اكتب: <code>صنف ساتان بيج</code>');
+    if (cmd === 'ask') return arg ? askAI(chatId, arg) : send(chatId, 'اكتب: <code>سؤال أنتج إيه للعيد؟</code>');
+    if (cmd === 'undo') return undo(chatId);
+    if (cmd === 'status') return status(chatId);
+    if (cmd === 'templates') return sendTemplates(chatId);
+    if (cmd === 'chatid') return send(chatId, `<code>${chatId}</code>`);
+    return;
+  }
+  const w = norm(t);
+  let x;
+  if ((x = w.match(/^صنف\s+(.+)/))) return findItem(chatId, x[1]);
+  if ((x = t.match(/^سؤال\s+([\s\S]+)/))) return askAI(chatId, x[1]);
+  if (/^(الغي|الغاء|الغي اخر ملف|undo)$/.test(w)) return undo(chatId);
+  if (/^(نماذج|نموذج|templates)$/.test(w)) return sendTemplates(chatId);
+  if (/^(حاله|الحاله|status)$/.test(w)) return status(chatId);
+  if (/^(قائمه|القائمه|menu|مساعده)$/.test(w)) return ACTIONS[B.help](chatId);
+  // فاتورة مكتوبة كرسالة: أول سطر فيه النوع
+  const type = detectType(t.split('\n')[0]);
+  if (ai.enabled() && ['sale', 'return', 'order'].includes(type) && t.split('\n').length > 2) {
+    const x2 = await ai.extractDocument({ text: t, caption: t.split('\n')[0] });
+    return send(chatId, await ingest(chatId, aiToParsed(x2), type, { source: 'ai-text', fileName: '', ai: true }));
+  }
+}
+
+async function askAI(c, q) {
+  if (!ai.enabled()) return send(c, 'الأسئلة محتاجة مفتاح Claude.');
+  await bot.api('sendChatAction', { chat_id: c, action: 'typing' }).catch(() => {});
+  return send(c, esc(await ai.ask(q, R.compactForAI(analysis().analysis))));
+}
+async function sendTemplates(c) {
+  for (const t of templates()) await bot.sendDocument(c, t.buffer, t.name, t.caption, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+}
+
+// ---------- ربط الجروب ----------
+async function isAdmin(chatId) {
+  try {
+    const m = await bot.api('getChatMember', { chat_id: chatId, user_id: me.id });
+    return m.status === 'administrator' || m.status === 'creator';
+  } catch { return false; }
+}
+
+async function linkChat(chatId, title) {
+  cfg.allowedChats.push(chatId);
+  saveSetting('ALLOWED_CHATS', cfg.allowedChats.join(','));
+  if (!cfg.reportChat) { cfg.reportChat = chatId; saveSetting('REPORT_CHAT', chatId); }
+  console.log(`\n  ✅ اتربط: ${title || chatId}\n`);
+  await send(chatId, `✅ <b>تمام! أنا جاهز</b>\n\n${HELP()}`, { reply_markup: MENU });
+  const isGroup = Number(chatId) < 0;
+  if (isGroup && !me.can_read_all_group_messages && !(await isAdmin(chatId))) {
+    await send(chatId, '⚠️ خطوة أخيرة: خليني <b>أدمن</b> في الجروب (إعدادات الجروب ← Administrators ← Add Admin) عشان أشوف الملفات اللي بتتبعت.');
+  }
+}
 
 async function onMessage(msg) {
   const chatId = String(msg.chat.id);
-  const text = msg.text || '';
+  const text = msg.text || msg.caption || '';
   if (!cfg.allowedChats.includes(chatId)) {
-    if (text.startsWith('/') || msg.document) {
-      await bot.send(chatId, `🔒 البوت لسه مش مربوط بالجروب ده.\nChat ID: <code>${chatId}</code>\nحطه في ملف settings.env في السطر ALLOWED_CHATS وشغّل البوت تاني.`);
+    // البوت اتضاف لجروب جديد
+    if (msg.new_chat_members?.some(u => u.id === me.id)) {
+      return send(chatId, '👋 أهلاً! عشان أشتغل هنا:\n1. خليني <b>أدمن</b> في الجروب\n2. ابعت <b>كود الربط</b> اللي ظاهر على شاشة الجهاز اللي شغّال عليه البوت');
     }
-    console.log(`رسالة من شات غير مسموح: ${chatId} (${msg.chat.title || msg.chat.username || ''})`);
+    if (norm(text).replace(/^\/start\s*/, '').trim() === LINK_CODE) return linkChat(chatId, msg.chat.title);
+    if (msg.text?.startsWith('/') || msg.document || msg.photo) {
+      await send(chatId, '🔒 ابعت كود الربط اللي ظاهر على شاشة الجهاز اللي شغّال عليه البوت.');
+    }
     return;
   }
   try {
+    if (msg.new_chat_members?.some(u => u.id === me.id)) return ACTIONS[B.help](chatId);
     if (msg.document) return await handleFile(msg, msg.document.file_id, msg.document.file_name || 'file', msg.document.mime_type || '');
-    if (msg.photo) {
-      const p = msg.photo[msg.photo.length - 1];
-      return await handleFile(msg, p.file_id, 'photo.jpg', 'image/jpeg');
-    }
-    const m = text.match(/^\/(\w+)(?:@\w+)?\s*([\s\S]*)$/);
-    if (m) {
-      const fn = COMMANDS[m[1].toLowerCase()];
-      if (fn) await fn(chatId, m[2].trim());
-      return;
-    }
-    // فاتورة مكتوبة كنص مع هاشتاج: #مبيعات ...
-    const type = text.startsWith('#') ? detectType(text.split('\n')[0]) : null;
-    if (type && ['sale', 'return', 'order'].includes(type) && text.split('\n').length > 1) {
-      if (!ai.enabled()) return bot.send(chatId, 'قراءة الفواتير المكتوبة كنص محتاجة تفعيل Claude. ابعتها Excel.');
-      const x = await ai.extractDocument({ text, caption: text.split('\n')[0] });
-      const parsed = { lines: x.lines.map(l => ({ ...l, qty: Math.abs(l.qty ?? 0), price: l.price ?? 0, total: l.total ?? (l.qty ?? 0) * (l.price ?? 0) })), meta: { doc_no: x.doc_no, date: x.date, customer: x.customer } };
-      await bot.send(chatId, await ingest(chatId, parsed, type, { source: 'ai-text', fileName: '', ai: true }), { reply_to_message_id: msg.message_id });
-    }
+    if (msg.photo) return await handleFile(msg, msg.photo[msg.photo.length - 1].file_id, 'photo.jpg', 'image/jpeg');
+    if (msg.text) return await onText(chatId, msg.text);
   } catch (e) {
     console.error(e);
-    await bot.send(chatId, `❌ ${esc(e.message)}`, { reply_to_message_id: msg.message_id }).catch(() => {});
+    await send(chatId, `❌ ${esc(e.message)}`, { reply_to_message_id: msg.message_id }).catch(() => {});
   }
 }
 
@@ -277,11 +337,11 @@ async function onCallback(q) {
   if (!p || String(q.message.chat.id) !== String(p.chatId)) return;
   pending.delete(id);
   await bot.api('editMessageReplyMarkup', { chat_id: p.chatId, message_id: q.message.message_id, reply_markup: { inline_keyboard: [] } }).catch(() => {});
-  if (type === 'skip') return bot.send(p.chatId, 'تمام، اتجاهل.');
-  try { await bot.send(p.chatId, await ingest(p.chatId, p.parsed, type, p.meta)); } catch (e) { await bot.send(p.chatId, `❌ ${esc(e.message)}`); }
+  if (type === 'skip') return send(p.chatId, 'تمام، اتجاهل.');
+  try { await send(p.chatId, await ingest(p.chatId, p.parsed, type, p.meta)); } catch (e) { await send(p.chatId, `❌ ${esc(e.message)}`); }
 }
 
-// ---------- الجدولة ----------
+// ---------- التقارير التلقائية ----------
 async function scheduler() {
   if (!cfg.reportChat) return;
   const d = today(), { hour, minute, weekday } = nowParts();
@@ -289,35 +349,35 @@ async function scheduler() {
   if (hour * 60 + minute < h * 60 + (m || 0)) return;
   if (store.getMeta('daily_sent') !== d) {
     store.setMeta('daily_sent', d);
-    const r = analysis();
-    await bot.send(cfg.reportChat, R.dailyMessage(r.period(d, d), r.analysis));
+    await ACTIONS[B.today](cfg.reportChat);
   }
   if (weekday === cfg.weeklyDay && store.getMeta('weekly_sent') !== d) {
     store.setMeta('weekly_sent', d);
+    await send(cfg.reportChat, '🗓️ <b>التقرير الأسبوعي</b>');
+    await fullReport(cfg.reportChat);
     const a = analysis().analysis;
-    await bot.send(cfg.reportChat, '🗓️ <b>التقرير الأسبوعي</b>\n\n' + R.summaryMessage(a));
-    await bot.send(cfg.reportChat, R.tasteMessage(a));
-    await bot.send(cfg.reportChat, R.modelsMessage(a));
-    await bot.send(cfg.reportChat, R.forecastMessage(a));
-    const insights = await dashboard(cfg.reportChat, ai.enabled());
-    if (insights) await bot.send(cfg.reportChat, '🧠 <b>التحليل الاستراتيجي</b>\n\n' + esc(insights));
-    await COMMANDS.excel(cfg.reportChat);
+    await send(cfg.reportChat, R.forecastMessage(a));
+    await send(cfg.reportChat, R.modelsMessage(a));
   }
 }
 
 // ---------- التشغيل ----------
 async function main() {
-  const me = await bot.api('getMe');
-  await bot.api('setMyCommands', { commands: [
-    ['today', 'تقرير النهارده'], ['report', 'ملخص وتصنيف الأصناف'], ['top', 'أقوى وأضعف الأصناف'], ['returns', 'تحليل المرتجعات'],
-    ['taste', 'ذوق السوق'], ['models', 'موديلات مقترحة'], ['forecast', 'توقع الطلب وخطة الإنتاج'], ['item', 'كارت صنف'],
-    ['dashboard', 'لوحة تفاعلية'], ['excel', 'ملف Excel'], ['insights', 'تحليل استراتيجي (AI)'], ['ask', 'اسأل عن البيانات (AI)'],
-    ['templates', 'نماذج ملفات'], ['undo', 'إلغاء آخر مستند'], ['status', 'حالة البيانات'], ['help', 'المساعدة'],
-  ].map(([command, description]) => ({ command, description })) }).catch(() => {});
-  console.log(`\n  ✅ البوت شغال: @${me.username}`);
-  console.log(`  الجروبات المسموحة: ${cfg.allowedChats.join(', ') || 'لسه مفيش — ابعت /chatid في الجروب'}`);
-  console.log(`  الذكاء الاصطناعي: ${ai.enabled() ? 'مفعّل (' + ai.MODEL + ')' : 'مش مفعّل'}`);
-  console.log('  سيب الشباك ده مفتوح طول ما البوت شغال.\n');
+  if (!cfg.token) await setupWizard();
+  bot = createBot(cfg.token);
+  me = await bot.api('getMe');
+  await bot.api('setMyCommands', { commands: [{ command: 'menu', description: 'القائمة' }] }).catch(() => {});
+
+  console.log(`\n  ✅ البوت شغال: @${me.username}   —   سيب الشباك ده مفتوح`);
+  console.log(`  الذكاء الاصطناعي: ${ai.enabled() ? 'شغال' : 'مش متفعّل'}`);
+  console.log(`
+  ┌─────────────────────────────────────────────┐
+     عشان تربط جروب:
+     1. ضيف @${me.username} للجروب واعمله أدمن
+     2. ابعت في الجروب الكود ده:    ${LINK_CODE}
+  └─────────────────────────────────────────────┘
+  ${cfg.allowedChats.length ? `(مربوط حالياً بـ ${cfg.allowedChats.length} جروب)` : ''}
+`);
 
   setInterval(() => scheduler().catch(e => console.error('scheduler:', e.message)), 60000);
   setInterval(() => { for (const [k, v] of pending) if (Date.now() - v.at > 86400000) pending.delete(k); }, 3600000);
@@ -339,4 +399,4 @@ async function main() {
   }
 }
 
-main().catch(e => { console.error('\n  ❌', e.message, '\n  اتأكد من التوكن ومن الإنترنت.\n'); process.exit(1); });
+main().catch(e => { console.error('\n  ❌', e.message, '\n  اتأكد من الإنترنت.\n'); process.exit(1); });

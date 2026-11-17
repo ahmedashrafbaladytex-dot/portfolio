@@ -22,6 +22,19 @@ function loadSettings(file = path.join(ROOT, 'settings.env')) {
   return true;
 }
 
+// يكتب قيمة في settings.env (بينشئه من النموذج لو مش موجود) — عشان محدش يفتح الملف بإيده
+function saveSetting(key, value, file = path.join(ROOT, 'settings.env')) {
+  if (!fs.existsSync(file)) {
+    const ex = path.join(ROOT, 'settings.example.env');
+    fs.writeFileSync(file, fs.existsSync(ex) ? fs.readFileSync(ex) : '');
+  }
+  const lines = fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '').split(/\r?\n/);
+  const i = lines.findIndex(l => l.trim().startsWith(key + '='));
+  if (i >= 0) lines[i] = `${key}=${value}`; else lines.push(`${key}=${value}`);
+  fs.writeFileSync(file, lines.join('\n'));
+  process.env[key] = String(value);
+}
+
 function config() {
   const num = (k, d) => (process.env[k] != null && process.env[k] !== '' ? Number(process.env[k]) : d);
   const defaultOrdersDb = path.join(ROOT, '..', 'orders-system', 'data', 'orders.db');
@@ -52,4 +65,4 @@ function run(store, cfg, asOf) {
   };
 }
 
-module.exports = { loadSettings, config, run, ROOT };
+module.exports = { loadSettings, saveSetting, config, run, ROOT };

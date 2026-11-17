@@ -72,7 +72,7 @@ function readTable(buf, fileName) {
     let best = null;
     for (const sh of sheets) {
       const t = locateTable(sh.rows);
-      if (t && (!best || t.score > best.score)) best = t;
+      if (t && (!best || t.score > best.score)) best = { ...t, hint: `${sh.name} ${t.hint}` };
     }
     return best;
   }
@@ -88,7 +88,8 @@ function locateTable(rows) {
     if ((map.item_code != null || map.item_name != null) && score >= 2 && (!best || score > best.score)) best = { r, map, score };
   }
   if (!best) return null;
-  return { header: best.map, rows: rows.slice(best.r + 1), meta: headerMeta(rows.slice(0, best.r)), score: best.score };
+  const above = rows.slice(0, best.r);
+  return { header: best.map, rows: rows.slice(best.r + 1), meta: headerMeta(above), score: best.score, hint: above.flat().filter(c => typeof c === 'string').join(' ') };
 }
 
 function headerMeta(rows) {
@@ -179,7 +180,21 @@ function parseFile(buf, fileName) {
   if (!table) throw new Error('مش لاقي جدول أصناف في الملف. لازم يكون فيه عمود «الصنف» أو «كود الصنف» وعمود «الكمية».');
   const lines = tableToLines(table);
   if (!lines.length) throw new Error('الجدول فاضي — مفيش سطور أصناف.');
-  return { lines, meta: table.meta, columns: Object.keys(table.header) };
+  const columns = Object.keys(table.header);
+  return { lines, meta: table.meta, columns, guess: guessType(table.hint, columns) };
+}
+
+// تخمين النوع من محتوى الملف نفسه (عنوان الشيت/الفاتورة والأعمدة)
+function guessType(hint, columns) {
+  const t = detectType(hint);
+  if (t === 'sale' || t === 'return' || t === 'order') return t;
+  if (columns.includes('reason')) return 'return';
+  const has = c => columns.includes(c);
+  // كود/اسم + كمية بس من غير سعر ولا رقم مستند ولا عميل = جرد
+  if (has('qty') && !has('price') && !has('total') && !has('doc_no') && !has('customer')) return 'stock';
+  // خصائص من غير كميات = بيانات أصناف
+  if (!has('qty') && ['category', 'fabric', 'color', 'pattern'].some(has)) return 'items';
+  return null;
 }
 
 module.exports = { parseFile, parseCsv, groupDocs, detectType, tableToLines, locateTable, fieldOf };

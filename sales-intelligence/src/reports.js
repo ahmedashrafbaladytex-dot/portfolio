@@ -15,10 +15,13 @@ function dailyMessage(p, a) {
   const L = [];
   L.push(`📊 <b>التقرير اليومي — ${p.to}</b>`);
   L.push('');
-  L.push(`💰 المبيعات: <b>${money(p.sale_val)}</b> (${fmt(p.sale_qty)} قطعة، ${p.invoices} فاتورة، ${p.customers} عميل) ${arrow(p.vsAvg)} ${p.vsAvg != null ? signedPct(p.vsAvg) + ' عن المتوسط' : ''}`);
+  if (!p.sale_val && !p.ret_val && !p.ord_val) L.push('📭 مفيش فواتير ولا مرتجعات ولا طلبيات اتسجلت في اليوم ده.');
+  else {
+  L.push(`💰 المبيعات: <b>${money(p.sale_val)}</b> (${fmt(p.sale_qty)} قطعة، ${p.invoices} فاتورة، ${p.customers} عميل) ${p.sale_val && p.vsAvg != null ? `${arrow(p.vsAvg)} ${signedPct(p.vsAvg)} عن المتوسط` : ''}`);
   L.push(`↩️ المرتجعات: <b>${money(p.ret_val)}</b> (${fmt(p.ret_qty)} قطعة، ${p.returns} إذن) ${p.sale_val ? `= ${pct(p.ret_val / p.sale_val)} من المبيعات` : ''}`);
   L.push(`📝 الطلبيات: <b>${money(p.ord_val)}</b> (${fmt(p.ord_qty)} قطعة، ${p.orders} طلبية) ${p.ord_val && p.ordVsAvg != null ? arrow(p.ordVsAvg) + ' ' + signedPct(p.ordVsAvg) : ''}`);
   L.push(`📈 صافي اليوم: <b>${money(p.sale_val - p.ret_val)}</b>`);
+  }
   if (p.topItems.length) {
     L.push('', '🏆 <b>الأكثر مبيعاً النهارده</b>');
     p.topItems.forEach((t, i) => L.push(`${i + 1}. ${esc(t.name)} — ${fmt(t.qty)}`));
@@ -118,7 +121,7 @@ function tasteMessage(a) {
 function modelsMessage(a) {
   const L = ['🧵 <b>موديلات مقترحة حسب ذوق السوق</b>', ''];
   const news = a.proposals.filter(p => p.type === 'new');
-  if (!news.length) L.push('محتاج بيانات خصائص أكتر للأصناف (فئة/خامة/لون/نقشة) — ابعت ملف أصناف أو استخدم /enrich');
+  if (!news.length) L.push('محتاج بيانات خصائص أكتر للأصناف (فئة/خامة/لون/نقشة) — ابعت ملف بيانات الأصناف (اكتب «نماذج» تاخد النموذج)');
   news.forEach((p, i) => {
     L.push(`${i + 1}. <b>${esc([p.category, p.fabric, p.color, p.pattern].filter(Boolean).join(' • '))}</b>`);
     L.push(`   شريحة السعر: ${esc(p.price_band || '—')}${p.price_range ? ` (${fmt(p.price_range[0])}–${fmt(p.price_range[1])} ج)` : ''} | طلب متوقع ≈ ${fmt(p.expected_weekly)} قطعة/أسبوع | تجربة مقترحة: ${fmt(Math.max(20, p.expected_weekly * 3))} قطعة`);

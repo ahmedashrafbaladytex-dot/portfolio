@@ -151,6 +151,10 @@ function wrap(db) {
       .run(...keys.map(k => attrs[k]), source, code);
   }
 
+  // أصناف خصائصها ناقصة ولسه الذكاء الاصطناعي ماجربش يكمّلها
+  const needEnrich = () => db.prepare(`SELECT * FROM items WHERE attr_source='rules' AND (category='' OR fabric='' OR color='' OR pattern='')`).all();
+  const markTried = codes => { const st = db.prepare(`UPDATE items SET attr_source='ai' WHERE code=? AND attr_source='rules'`); for (const c of codes) st.run(c); };
+
   function deleteDoc(id) { return db.prepare('DELETE FROM docs WHERE id=?').run(id).changes; }
   function lastDoc(chatId) {
     return db.prepare('SELECT * FROM docs WHERE chat_id=? ORDER BY id DESC LIMIT 1').get(String(chatId));
@@ -165,7 +169,7 @@ function wrap(db) {
   const stock = () => db.prepare('SELECT * FROM stock').all();
   const counts = () => db.prepare(`SELECT type, COUNT(*) n, MIN(doc_date) first, MAX(doc_date) last FROM docs GROUP BY type`).all();
 
-  return { db, tx, getMeta, setMeta, saveDoc, saveStock, saveItems, updateItemAttrs, deleteDoc, lastDoc, allLines, items, stock, counts, resolveItem };
+  return { db, tx, getMeta, setMeta, needEnrich, markTried, saveDoc, saveStock, saveItems, updateItemAttrs, deleteDoc, lastDoc, allLines, items, stock, counts, resolveItem };
 }
 
 function pick(o, keys) {
