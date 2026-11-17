@@ -1,0 +1,16 @@
+{
+  "name": "sales-intelligence",
+  "version": "1.0.0",
+  "description": "بوت تليجرام لتحليل المبيعات والمرتجعات والطلبيات وذوق السوق والتنبؤ بالطلب",
+  "main": "bot.js",
+  "private": true,
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "start": "node bot.js",
+    "demo": "node scripts/demo.js",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "1.9.0"
+  }
+}
