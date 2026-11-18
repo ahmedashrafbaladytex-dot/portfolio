@@ -21,9 +21,11 @@ const crypto = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
 const { exec } = require('node:child_process');
 
-const PORT = Number(process.env.PORT) || 3000;
+const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
 const PASSWORD = process.env.APP_PASSWORD || '';
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+const DATA_DIR = process.env.DATA_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH || path.join(__dirname, 'data');
+// على Railway من غير Volume البيانات بتتمسح مع كل تحديث
+const STORAGE_WARNING = !!process.env.RAILWAY_ENVIRONMENT && !process.env.RAILWAY_VOLUME_MOUNT_PATH && !process.env.DATA_DIR;
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const DB_FILE = path.join(DATA_DIR, 'orders.db');
 const BACKUP_DIR = path.join(DATA_DIR, 'backups');
@@ -70,6 +72,7 @@ CREATE TABLE IF NOT EXISTS order_log (
   action TEXT NOT NULL,
   at TEXT DEFAULT (datetime('now','localtime'))
 );
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
 CREATE INDEX IF NOT EXISTS idx_orders_customer ON orders(customer_id);
 CREATE INDEX IF NOT EXISTS idx_orders_due ON orders(due_date);
 CREATE INDEX IF NOT EXISTS idx_items_order ON order_items(order_id);
@@ -210,6 +213,14 @@ function setStatus(id, status) {
   return getOrder(old.id);
 }
 
+function getOrderByCode(code) {
+  const row = db.prepare('SELECT id FROM orders WHERE code = ? COLLATE NOCASE').get(str(code, 40));
+  return row ? getOrder(row.id) : null;
+}
+
+const getSetting = key => (db.prepare('SELECT value FROM settings WHERE key=?').get(key) || {}).value ?? null;
+const setSetting = (key, value) => db.prepare('INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, String(value));
+
 // ---------- العملاء ----------
 const CUSTOMER_STATS = `
 SELECT c.*,
@@ -305,7 +316,7 @@ backup();
 setInterval(backup, 6 * 60 * 60 * 1000).unref();
 
 // ---------- HTTP ----------
-const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.ico': 'image/x-icon' };
+const MIME = { '.png': 'image/png', '.webmanifest': 'application/manifest+json', '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.ico': 'image/x-icon' };
 
 function send(res, status, body, type = 'application/json; charset=utf-8', extra = {}) {
   res.writeHead(status, { 'Content-Type': type, 'Cache-Control': 'no-store', ...extra });
@@ -321,13 +332,31 @@ function readBody(req) {
   });
 }
 
+// ---------- تسجيل الدخول ----------
+const SESSION = PASSWORD ? crypto.createHmac('sha256', PASSWORD).update('orders-session-v1').digest('hex') : '';
+const PUBLIC_PATHS = new Set(['/login.html', '/style.css', '/manifest.webmanifest', '/icon-192.png', '/icon-512.png', '/apple-touch-icon.png', '/healthz', '/login']);
+const failures = new Map();
+
+const safeEqual = (a, b) => { const x = Buffer.from(String(a)), y = Buffer.from(String(b)); return x.length === y.length && crypto.timingSafeEqual(x, y); };
+function cookies(req) {
+  return Object.fromEntries((req.headers.cookie || '').split(';').map(c => c.trim().split('=')).filter(p => p.length === 2));
+}
 function authorized(req) {
-  if (!PASSWORD) return true;
-  const h = req.headers.authorization || '';
-  if (!h.startsWith('Basic ')) return false;
-  const pass = Buffer.from(h.slice(6), 'base64').toString('utf8').split(':').slice(1).join(':');
-  const a = Buffer.from(pass), b = Buffer.from(PASSWORD);
-  return a.length === b.length && crypto.timingSafeEqual(a, b);
+  return !PASSWORD || safeEqual(cookies(req).sid || '', SESSION);
+}
+async function login(req, res) {
+  const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+  const f = failures.get(ip) || { n: 0, until: 0 };
+  if (f.until > Date.now()) throw new HttpError(429, 'محاولات كتير غلط. استنى ربع ساعة وجرب تاني.');
+  const { password } = await readBody(req);
+  if (!PASSWORD || !safeEqual(password || '', PASSWORD)) {
+    f.n++; if (f.n >= 10) { f.until = Date.now() + 15 * 60 * 1000; f.n = 0; }
+    failures.set(ip, f);
+    throw new HttpError(401, 'كلمة المرور غلط');
+  }
+  failures.delete(ip);
+  const secure = req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : '';
+  return send(res, 200, { ok: true }, undefined, { 'Set-Cookie': `sid=${SESSION}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000${secure}` });
 }
 
 async function api(req, res, url) {
@@ -337,7 +366,7 @@ async function api(req, res, url) {
   const [res1, id, sub] = parts;
 
   if (res1 === 'dashboard' && m === 'GET') return send(res, 200, dashboard());
-  if (res1 === 'meta' && m === 'GET') return send(res, 200, { statuses: STATUS_AR, today: today() });
+  if (res1 === 'meta' && m === 'GET') return send(res, 200, { statuses: STATUS_AR, today: today(), storage_warning: STORAGE_WARNING, auth: !!PASSWORD });
 
   if (res1 === 'customers') {
     if (!id && m === 'GET') return send(res, 200, listCustomers(q));
@@ -378,8 +407,15 @@ async function api(req, res, url) {
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
-  if (!authorized(req)) return send(res, 401, 'مطلوب كلمة المرور', 'text/plain; charset=utf-8', { 'WWW-Authenticate': 'Basic realm="Orders", charset="UTF-8"' });
   try {
+    if (url.pathname === '/healthz') return send(res, 200, { ok: true });
+    if (url.pathname === '/login' && req.method === 'POST') return await login(req, res);
+    if (url.pathname === '/logout') return send(res, 302, '', 'text/plain', { 'Set-Cookie': 'sid=; Path=/; Max-Age=0', Location: '/login.html' });
+    if (!authorized(req) && !PUBLIC_PATHS.has(url.pathname)) {
+      if (url.pathname.startsWith('/api/')) return send(res, 401, { error: 'لازم تسجل دخول' });
+      return send(res, 302, '', 'text/plain', { Location: '/login.html' });
+    }
+    if (url.pathname === '/login.html' && (!PASSWORD || authorized(req))) return send(res, 302, '', 'text/plain', { Location: '/' });
     if (url.pathname.startsWith('/api/')) return await api(req, res, url);
     let rel;
     try { rel = decodeURIComponent(url.pathname); } catch { return send(res, 400, 'Bad request', 'text/plain'); }
@@ -417,9 +453,25 @@ server.listen(PORT, '0.0.0.0', () => {
   for (const ip of ips) console.log(`  من أي جهاز على الشبكة: http://${ip}:${PORT}`);
   console.log(`  قاعدة البيانات: ${DB_FILE}`);
   console.log(PASSWORD ? '  الحماية بكلمة مرور: مفعّلة' : '  تنبيه: مفيش كلمة مرور (APP_PASSWORD)');
-  console.log('  متقفلش الشباك ده طول ما السيستم شغال. Keep this window open while using the system.');
+  if (STORAGE_WARNING) console.log('  ⚠️ تحذير: مفيش Volume على Railway، البيانات هتتمسح مع أي تحديث!');
+  else if (!process.env.RAILWAY_ENVIRONMENT) console.log('  متقفلش الشباك ده طول ما السيستم شغال. Keep this window open while using the system.');
   console.log('');
   openBrowser();
 });
 
-module.exports = { server, db };
+const core = { listOrders, getOrder, getOrderByCode, createOrder, setStatus, listCustomers, getCustomer, saveCustomer, dashboard,
+  today, getSetting, setSetting, STATUS_AR };
+
+let bot = null;
+if (process.env.TELEGRAM_BOT_TOKEN) {
+  bot = require('./bot').createBot({
+    token: process.env.TELEGRAM_BOT_TOKEN,
+    allowedIds: process.env.TELEGRAM_ALLOWED_IDS,
+    dailyHour: process.env.DAILY_REPORT_HOUR,
+    publicUrl: process.env.PUBLIC_URL || (process.env.RAILWAY_PUBLIC_DOMAIN ? 'https://' + process.env.RAILWAY_PUBLIC_DOMAIN : ''),
+    core,
+  });
+  bot.start();
+}
+
+module.exports = { server, db, core };

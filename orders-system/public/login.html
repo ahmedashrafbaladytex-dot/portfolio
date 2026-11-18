@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>تسجيل الدخول · نظام الطلبات</title>
+<link rel="stylesheet" href="style.css">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<meta name="theme-color" content="#0f172a">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="الطلبات">
+</head>
+<body class="login-page">
+<form class="card login-box" id="f">
+  <div class="logo">📦</div>
+  <h1>نظام الطلبات</h1>
+  <p>اكتب كلمة المرور عشان تدخل</p>
+  <input type="password" name="password" autocomplete="current-password" required autofocus placeholder="كلمة المرور">
+  <button class="btn primary">دخول</button>
+  <div class="login-error" id="err" role="alert"></div>
+</form>
+<script>
+document.getElementById('f').addEventListener('submit', async e => {
+  e.preventDefault();
+  const err = document.getElementById('err');
+  err.textContent = '';
+  try {
+    const r = await fetch('/login', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: e.target.password.value }) });
+    const d = await r.json().catch(() => ({}));
+    if (r.ok) location.href = '/';
+    else err.textContent = d.error || 'حصل خطأ';
+  } catch { err.textContent = 'مفيش اتصال بالسيرفر'; }
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,4 @@
+.git
+orders-system/data
+orders-system/test
+**/node_modules

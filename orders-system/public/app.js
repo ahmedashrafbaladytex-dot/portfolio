@@ -21,6 +21,7 @@ async function api(path, opts = {}) {
     headers: opts.body ? { 'Content-Type': 'application/json' } : {},
     body: opts.body ? JSON.stringify(opts.body) : undefined,
   });
+  if (res.status === 401) { location.href = '/login.html'; throw new Error('لازم تسجل دخول'); }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || 'حصل خطأ');
   return data;
@@ -451,5 +452,10 @@ async function refreshBadge() {
 
 document.getElementById('todayLabel').textContent = new Date().toLocaleDateString('ar-EG-u-nu-latn', { weekday: 'long', day: 'numeric', month: 'long' });
 window.addEventListener('hashchange', route);
-api('meta').then(m => { TODAY = m.today; }).catch(() => {}).finally(route);
+api('meta').then(m => {
+  TODAY = m.today;
+  if (m.auth) document.getElementById('logout').hidden = false;
+  if (m.storage_warning) document.body.insertAdjacentHTML('afterbegin',
+    '<div class="storage-warning">⚠️ مفيش Volume متوصل على Railway، أي بيانات هتدخلها هتتمسح مع أول تحديث. شوف ملف README.</div>');
+}).catch(() => {}).finally(route);
 setInterval(refreshBadge, 60000);

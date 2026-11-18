@@ -5,6 +5,13 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>نظام طلبات العملاء</title>
 <link rel="stylesheet" href="style.css">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<meta name="theme-color" content="#0f172a">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="الطلبات">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%231d4ed8'/><path d='M9 10h14M9 16h14M9 22h9' stroke='white' stroke-width='3' stroke-linecap='round'/></svg>">
 </head>
 <body>
@@ -21,6 +28,7 @@
     <a href="#/customers" data-nav="customers"><span>👥</span>العملاء</a>
     <a href="#/reports" data-nav="reports"><span>📊</span>تقرير العملاء</a>
     <a href="#/settings" data-nav="settings"><span>⚙️</span>النسخ الاحتياطي</a>
+    <a href="/logout" id="logout" hidden><span>🚪</span>خروج</a>
   </nav>
 </aside>
 <main id="app"><div class="loading">جاري التحميل…</div></main>
