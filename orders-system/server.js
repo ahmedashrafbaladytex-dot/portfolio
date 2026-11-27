@@ -333,7 +333,22 @@ function readBody(req) {
 }
 
 // ---------- تسجيل الدخول ----------
-const SESSION = PASSWORD ? crypto.createHmac('sha256', PASSWORD).update('orders-session-v1').digest('hex') : '';
+// كلمة المرور: لو اتغيرت من صفحة الإعدادات بتتحفظ (مشفّرة) في قاعدة البيانات، وإلا بنستخدم APP_PASSWORD
+const passwordHash = () => getSetting('password_hash');
+const authEnabled = () => !!(passwordHash() || PASSWORD);
+function checkPassword(p) {
+  const stored = passwordHash();
+  if (stored) {
+    const [salt, hash] = stored.split(':');
+    return safeEqual(crypto.scryptSync(String(p), salt, 32).toString('hex'), hash);
+  }
+  return !!PASSWORD && safeEqual(p, PASSWORD);
+}
+const session = () => crypto.createHmac('sha256', passwordHash() || PASSWORD).update('orders-session-v1').digest('hex');
+function sessionCookie(req) {
+  const secure = req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : '';
+  return `sid=${session()}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000${secure}`;
+}
 const PUBLIC_PATHS = new Set(['/login.html', '/style.css', '/manifest.webmanifest', '/icon-192.png', '/icon-512.png', '/apple-touch-icon.png', '/healthz', '/login']);
 const failures = new Map();
 
@@ -342,21 +357,70 @@ function cookies(req) {
   return Object.fromEntries((req.headers.cookie || '').split(';').map(c => c.trim().split('=')).filter(p => p.length === 2));
 }
 function authorized(req) {
-  return !PASSWORD || safeEqual(cookies(req).sid || '', SESSION);
+  return !authEnabled() || safeEqual(cookies(req).sid || '', session());
 }
 async function login(req, res) {
   const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
   const f = failures.get(ip) || { n: 0, until: 0 };
   if (f.until > Date.now()) throw new HttpError(429, 'محاولات كتير غلط. استنى ربع ساعة وجرب تاني.');
   const { password } = await readBody(req);
-  if (!PASSWORD || !safeEqual(password || '', PASSWORD)) {
+  if (!authEnabled() || !checkPassword(password || '')) {
     f.n++; if (f.n >= 10) { f.until = Date.now() + 15 * 60 * 1000; f.n = 0; }
     failures.set(ip, f);
     throw new HttpError(401, 'كلمة المرور غلط');
   }
   failures.delete(ip);
-  const secure = req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : '';
-  return send(res, 200, { ok: true }, undefined, { 'Set-Cookie': `sid=${SESSION}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000${secure}` });
+  return send(res, 200, { ok: true }, undefined, { 'Set-Cookie': sessionCookie(req) });
+}
+
+async function changePassword(req, res) {
+  const { current, password } = await readBody(req);
+  if (authEnabled() && !checkPassword(current || '')) throw new HttpError(400, 'كلمة المرور الحالية غلط');
+  if (typeof password !== 'string' || password.length < 6) throw new HttpError(400, 'كلمة المرور الجديدة لازم تكون ٦ حروف على الأقل');
+  const salt = crypto.randomBytes(16).toString('hex');
+  setSetting('password_hash', `${salt}:${crypto.scryptSync(password, salt, 32).toString('hex')}`);
+  // الكوكي الجديدة: الأجهزة التانية هتحتاج تسجل دخول تاني
+  return send(res, 200, { ok: true }, undefined, { 'Set-Cookie': sessionCookie(req) });
+}
+
+// ---------- ربط تليجرام ----------
+const tg = { bot: null, username: '', error: '' };
+const tgToken = () => getSetting('telegram_token') || process.env.TELEGRAM_BOT_TOKEN || '';
+const tgIds = () => [...new Set([...(getSetting('telegram_allowed_ids') || '').split(','),
+  ...String(process.env.TELEGRAM_ALLOWED_IDS || '').split(/[,\s]+/)].filter(Boolean))];
+const tgAccess = {
+  has: id => tgIds().includes(String(id)),
+  list: tgIds,
+  add: id => { setSetting('telegram_allowed_ids', [...new Set([...(getSetting('telegram_allowed_ids') || '').split(','), String(id)].filter(Boolean))].join(','));
+    setSetting('telegram_link_code', crypto.randomBytes(12).toString('hex')); },
+  linkCode: () => getSetting('telegram_link_code'),
+};
+async function tgGetMe(token) {
+  let r;
+  try { r = await fetch(`https://api.telegram.org/bot${token}/getMe`, { signal: AbortSignal.timeout(15000) }); }
+  catch { throw new HttpError(502, 'مش قادر أوصل لتليجرام دلوقتي. جرب تاني كمان شوية.'); }
+  const j = await r.json().catch(() => ({}));
+  if (!j.ok) throw new HttpError(400, 'التوكن ده مش شغال. اتأكد إنك نسخته كامل من BotFather.');
+  return j.result.username;
+}
+async function startBot() {
+  if (tg.bot) { tg.bot.stop(); tg.bot = null; }
+  tg.username = ''; tg.error = '';
+  const token = tgToken();
+  if (!token) return;
+  if (!tgAccess.linkCode()) setSetting('telegram_link_code', crypto.randomBytes(12).toString('hex'));
+  try { tg.username = await tgGetMe(token); } catch (e) { tg.error = e.message; }
+  tg.bot = require('./bot').createBot({
+    token, access: tgAccess, core,
+    dailyHour: process.env.DAILY_REPORT_HOUR,
+    publicUrl: process.env.PUBLIC_URL || (process.env.RAILWAY_PUBLIC_DOMAIN ? 'https://' + process.env.RAILWAY_PUBLIC_DOMAIN : ''),
+  });
+  tg.bot.start();
+}
+function tgStatus() {
+  const enabled = !!tgToken();
+  return { enabled, from_env: enabled && !getSetting('telegram_token'), username: tg.username, error: tg.error, linked: tgIds().length,
+    link: enabled && tg.username ? `https://t.me/${tg.username}?start=${tgAccess.linkCode()}` : '' };
 }
 
 async function api(req, res, url) {
@@ -366,7 +430,26 @@ async function api(req, res, url) {
   const [res1, id, sub] = parts;
 
   if (res1 === 'dashboard' && m === 'GET') return send(res, 200, dashboard());
-  if (res1 === 'meta' && m === 'GET') return send(res, 200, { statuses: STATUS_AR, today: today(), storage_warning: STORAGE_WARNING, auth: !!PASSWORD });
+  if (res1 === 'meta' && m === 'GET') return send(res, 200, { statuses: STATUS_AR, today: today(), storage_warning: STORAGE_WARNING, auth: authEnabled() });
+  if (res1 === 'password' && m === 'POST') return changePassword(req, res);
+
+  if (res1 === 'telegram') {
+    if (!id && m === 'GET') return send(res, 200, tgStatus());
+    if (!id && m === 'POST') {
+      const token = str((await readBody(req)).token, 100).replace(/\s+/g, '');
+      if (!/^\d{5,}:[\w-]{30,}$/.test(token)) throw new HttpError(400, 'شكل التوكن غلط. انسخه كامل من BotFather، شكله كده 123456789:ABC...');
+      await tgGetMe(token);
+      if (token !== getSetting('telegram_token')) { setSetting('telegram_token', token); setSetting('telegram_allowed_ids', ''); }
+      setSetting('telegram_link_code', crypto.randomBytes(12).toString('hex'));
+      await startBot();
+      return send(res, 200, tgStatus());
+    }
+    if (!id && m === 'DELETE') {
+      for (const k of ['telegram_token', 'telegram_allowed_ids', 'telegram_link_code']) db.prepare('DELETE FROM settings WHERE key=?').run(k);
+      await startBot();
+      return send(res, 200, tgStatus());
+    }
+  }
 
   if (res1 === 'customers') {
     if (!id && m === 'GET') return send(res, 200, listCustomers(q));
@@ -415,7 +498,7 @@ const server = http.createServer(async (req, res) => {
       if (url.pathname.startsWith('/api/')) return send(res, 401, { error: 'لازم تسجل دخول' });
       return send(res, 302, '', 'text/plain', { Location: '/login.html' });
     }
-    if (url.pathname === '/login.html' && (!PASSWORD || authorized(req))) return send(res, 302, '', 'text/plain', { Location: '/' });
+    if (url.pathname === '/login.html' && (!authEnabled() || authorized(req))) return send(res, 302, '', 'text/plain', { Location: '/' });
     if (url.pathname.startsWith('/api/')) return await api(req, res, url);
     let rel;
     try { rel = decodeURIComponent(url.pathname); } catch { return send(res, 400, 'Bad request', 'text/plain'); }
@@ -452,7 +535,7 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`  على الجهاز ده:        http://localhost:${PORT}`);
   for (const ip of ips) console.log(`  من أي جهاز على الشبكة: http://${ip}:${PORT}`);
   console.log(`  قاعدة البيانات: ${DB_FILE}`);
-  console.log(PASSWORD ? '  الحماية بكلمة مرور: مفعّلة' : '  تنبيه: مفيش كلمة مرور (APP_PASSWORD)');
+  console.log(authEnabled() ? '  الحماية بكلمة مرور: مفعّلة' : '  تنبيه: مفيش كلمة مرور (APP_PASSWORD)');
   if (STORAGE_WARNING) console.log('  ⚠️ تحذير: مفيش Volume على Railway، البيانات هتتمسح مع أي تحديث!');
   else if (!process.env.RAILWAY_ENVIRONMENT) console.log('  متقفلش الشباك ده طول ما السيستم شغال. Keep this window open while using the system.');
   console.log('');
@@ -462,16 +545,6 @@ server.listen(PORT, '0.0.0.0', () => {
 const core = { listOrders, getOrder, getOrderByCode, createOrder, setStatus, listCustomers, getCustomer, saveCustomer, dashboard,
   today, getSetting, setSetting, STATUS_AR };
 
-let bot = null;
-if (process.env.TELEGRAM_BOT_TOKEN) {
-  bot = require('./bot').createBot({
-    token: process.env.TELEGRAM_BOT_TOKEN,
-    allowedIds: process.env.TELEGRAM_ALLOWED_IDS,
-    dailyHour: process.env.DAILY_REPORT_HOUR,
-    publicUrl: process.env.PUBLIC_URL || (process.env.RAILWAY_PUBLIC_DOMAIN ? 'https://' + process.env.RAILWAY_PUBLIC_DOMAIN : ''),
-    core,
-  });
-  bot.start();
-}
+if (!process.env.NO_BOT) startBot().catch(e => console.error('Telegram:', e.message));
 
-module.exports = { server, db, core };
+module.exports = { server, db, core, tgAccess };

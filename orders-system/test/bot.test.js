@@ -34,10 +34,28 @@ test('parsers', () => {
   assert.equal(parseDate('31/2/2026', '2026-11-18'), null);
 });
 
-test('stranger is rejected and only told their id', async () => {
+test('stranger is rejected', async () => {
   await msg('/late', STRANGER);
   assert.match(last().text, /خاص/);
-  assert.match(last().text, /999/);
+  await tap('st:1:delivered', STRANGER);
+  assert.equal(sent.at(-1).method, 'answerCallbackQuery');
+});
+
+test('linking an account with the one-time link from the settings page', async () => {
+  const { tgAccess } = require('../server.js');
+  const LINKED = 222;
+  const linkBot = createBot({ token: 'x', access: tgAccess, core, call, log: { log() {}, error() {} } });
+  core.setSetting('telegram_link_code', 'secret123');
+  const m = (text, id) => linkBot.handleUpdate({ update_id: uid++, message: { chat: { id }, from: { id }, text } });
+  await m('/start wrong', LINKED);
+  assert.match(last().text, /خاص/);
+  assert.equal(tgAccess.has(LINKED), false);
+  await m('/start secret123', LINKED);
+  assert.match(last().text, /تم ربط حسابك/);
+  assert.equal(tgAccess.has(LINKED), true);
+  assert.notEqual(tgAccess.linkCode(), 'secret123', 'link is single-use');
+  await m('/start secret123', 333);
+  assert.equal(tgAccess.has(333), false);
 });
 
 test('new order wizard, customer report, status change, late report', async () => {

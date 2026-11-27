@@ -364,17 +364,75 @@ async function pageReports() {
 }
 
 // ---------- الإعدادات / النسخ الاحتياطي ----------
-function pageSettings() {
+async function pageSettings() {
+  const t = await api('telegram');
   $app.innerHTML = `
-  <div class="page-head"><div><h1>⚙️ النسخ الاحتياطي والتصدير</h1></div></div>
-  <div class="card"><h2>نسخة احتياطية</h2>
-    <p>السيستم بياخد نسخة احتياطية تلقائي كل ٦ ساعات في فولدر <span class="code">data/backups</span> (بيحتفظ بآخر ٣٠ يوم).
-    تقدر كمان تنزّل نسخة دلوقتي وتحفظها على فلاشة أو جوجل درايف.</p>
-    <a class="btn primary" href="/api/export/backup.db">⬇ تنزيل نسخة احتياطية الآن</a>
-    <p class="muted" style="font-size:13px">للاسترجاع: اقفل السيستم، وحط ملف النسخة مكان <span class="code">data/orders.db</span>، وشغّله تاني.</p></div>
-  <div class="card"><h2>تصدير لـ Excel</h2><div class="actions">
+  <div class="page-head"><div><h1>⚙️ الإعدادات</h1></div></div>
+  <div class="card"><h2>🤖 ربط تليجرام</h2><div id="tg">${telegramCard(t)}</div></div>
+  <div class="card"><h2>🔒 كلمة المرور</h2>
+    <form id="pw" class="form-grid" style="max-width:640px">
+      <div class="field"><label>كلمة المرور الحالية</label><input type="password" name="current" autocomplete="current-password"></div>
+      <div class="field"><label class="req">كلمة المرور الجديدة</label><input type="password" name="password" required minlength="6" autocomplete="new-password"></div>
+      <div class="field"><label class="req">اكتبها تاني</label><input type="password" name="confirm" required minlength="6" autocomplete="new-password"></div>
+      <div class="field" style="justify-content:end"><button class="btn primary">تغيير كلمة المرور</button></div>
+    </form></div>
+  <div class="card"><h2>💾 نسخة احتياطية</h2>
+    <p>السيستم بياخد نسخة احتياطية تلقائي كل ٦ ساعات (بيحتفظ بآخر ٣٠ يوم).
+    يُفضَّل كمان تنزّل نسخة كل أسبوع وتحفظها على جوجل درايف أو فلاشة.</p>
+    <a class="btn primary" href="/api/export/backup.db">⬇ تنزيل نسخة احتياطية الآن</a></div>
+  <div class="card"><h2>📤 تصدير لـ Excel</h2><div class="actions">
     <a class="btn" href="/api/export/orders.csv">كل الطلبات</a><a class="btn" href="/api/export/orders.csv?late=1">الطلبات المتأخرة</a>
     <a class="btn" href="/api/export/orders.csv?open=1">الطلبات المفتوحة</a><a class="btn" href="/api/export/customers.csv">تقرير العملاء</a></div></div>`;
+  bindTelegram();
+  const pw = document.getElementById('pw');
+  pw.addEventListener('submit', async e => {
+    e.preventDefault();
+    const f = Object.fromEntries(new FormData(pw));
+    if (f.password !== f.confirm) return toast('كلمتين المرور مش زي بعض', true);
+    try { await api('password', { method: 'POST', body: f }); pw.reset(); toast('اتغيرت كلمة المرور ✔'); document.getElementById('logout').hidden = false; }
+    catch (err) { toast(err.message, true); }
+  });
+}
+
+function telegramCard(t) {
+  if (!t.enabled) return `
+    <p>اربط السيستم ببوت تليجرام عشان يبعتلك المتأخر كل يوم الصبح، وتسأله عن أي عميل أو طلب، وتسجّل طلبات من الموبايل.</p>
+    <ol class="steps">
+      <li>افتح تليجرام وابحث عن <a href="https://t.me/BotFather" target="_blank" rel="noopener"><b>@BotFather</b></a> (عليه علامة زرقا ✔) وابعتله <span class="code">/newbot</span></li>
+      <li>اكتب اسم للبوت (مثلاً: طلبات المصنع)، وبعدين يوزر لازم يخلص بـ <span class="code">bot</span></li>
+      <li>هيبعتلك <b>توكن</b> شكله كده <span class="code">123456789:ABC…</span>. انسخه وحطه هنا:</li>
+    </ol>
+    <form id="tgForm" style="display:flex;gap:8px;flex-wrap:wrap;max-width:640px">
+      <input name="token" required placeholder="الصق التوكن هنا" style="flex:1;min-width:220px;direction:ltr" autocomplete="off">
+      <button class="btn primary">ربط البوت</button>
+    </form>`;
+  return `
+    ${t.error ? `<p class="pill late-pill">${esc(t.error)}</p>` : ''}
+    <p>البوت ${t.username ? `<a href="https://t.me/${esc(t.username)}" target="_blank" rel="noopener"><b>@${esc(t.username)}</b></a>` : ''} شغال ✔ ·
+      حسابات مربوطة: <b>${t.linked}</b></p>
+    ${t.link ? `<p>${t.linked ? 'عشان تربط حساب تاني (موبايل تاني أو شريك)' : '<b>آخر خطوة:</b> دوس على الزرار ده من الجهاز اللي عليه تليجرام، وبعدين دوس <b>Start</b>'}:</p>
+    <div class="actions"><a class="btn primary" href="${esc(t.link)}" target="_blank" rel="noopener">📲 افتح البوت واربط حسابي</a>
+      <button class="btn" id="tgRefresh">🔄 تحديث</button></div>` : ''}
+    ${t.from_env ? '' : '<p style="margin-top:16px"><button class="btn danger sm" id="tgOff">فصل البوت</button></p>'}`;
+}
+
+function bindTelegram() {
+  const box = document.getElementById('tg');
+  const render = t => { box.innerHTML = telegramCard(t); bindTelegram(); };
+  const form = document.getElementById('tgForm');
+  if (form) form.addEventListener('submit', async e => {
+    e.preventDefault();
+    const btn = form.querySelector('button'); btn.disabled = true; btn.textContent = 'جاري الربط…';
+    try { render(await api('telegram', { method: 'POST', body: { token: form.token.value } })); toast('البوت اتربط ✔'); }
+    catch (err) { toast(err.message, true); btn.disabled = false; btn.textContent = 'ربط البوت'; }
+  });
+  const r = document.getElementById('tgRefresh');
+  if (r) r.onclick = async () => render(await api('telegram'));
+  const off = document.getElementById('tgOff');
+  if (off) off.onclick = async () => {
+    if (!(await confirmDialog('فصل البوت؟ هيبطل يبعت رسايل، وتقدر تربطه تاني في أي وقت.'))) return;
+    render(await api('telegram', { method: 'DELETE' })); toast('البوت اتفصل');
+  };
 }
 
 // ---------- نوافذ ----------
@@ -433,7 +491,7 @@ async function route() {
     else if (p[0] === 'customers' && p[1]) await pageCustomer(p[1]);
     else if (p[0] === 'customers') await pageCustomers(params);
     else if (p[0] === 'reports') await pageReports();
-    else if (p[0] === 'settings') pageSettings();
+    else if (p[0] === 'settings') await pageSettings();
     else $app.innerHTML = '<div class="empty">الصفحة غير موجودة</div>';
   } catch (e) {
     $app.innerHTML = `<div class="card empty">⚠️ ${esc(e.message)}<br><br><a class="btn" href="#/">رجوع للرئيسية</a></div>`;

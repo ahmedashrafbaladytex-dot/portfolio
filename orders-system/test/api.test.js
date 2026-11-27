@@ -71,3 +71,20 @@ test('full flow: customers, orders, late, report', async () => {
   const s = await call('search-nothing');
   assert.equal(s.status, 404);
 });
+
+test('password set from settings page protects the app', async () => {
+  assert.equal((await call('meta')).data.auth, false);
+  assert.equal((await call('password', 'POST', { password: '123' })).status, 400, 'too short');
+  const set = await fetch(base + '/api/password', { method: 'POST', body: JSON.stringify({ password: 'new-pass-1' }) });
+  assert.equal(set.status, 200);
+  const cookie = set.headers.get('set-cookie').split(';')[0];
+  assert.equal((await call('dashboard')).status, 401, 'locked without cookie');
+  assert.equal((await fetch(base + '/api/dashboard', { headers: { cookie } })).status, 200);
+  assert.equal((await fetch(base + '/login', { method: 'POST', body: JSON.stringify({ password: 'wrong' }) })).status, 401);
+  const ok = await fetch(base + '/login', { method: 'POST', body: JSON.stringify({ password: 'new-pass-1' }) });
+  assert.equal(ok.status, 200);
+  const changed = await fetch(base + '/api/password', { method: 'POST', headers: { cookie }, body: JSON.stringify({ current: 'bad', password: 'xxxxxxx' }) });
+  assert.equal(changed.status, 400, 'current password required');
+  const bad = await fetch(base + '/api/telegram', { method: 'POST', headers: { cookie }, body: JSON.stringify({ token: 'not-a-token' }) });
+  assert.equal(bad.status, 400);
+});

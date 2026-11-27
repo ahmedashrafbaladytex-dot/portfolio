@@ -58,8 +58,16 @@ function chunk(text) {
   return out;
 }
 
-function createBot({ token, allowedIds, dailyHour, publicUrl = '', core, call, log = console }) {
-  const allowed = new Set(String(allowedIds || '').split(/[,\s]+/).filter(Boolean));
+// access: { has(id), list(), add(id), linkCode() } — مين مسموحله يستخدم البوت
+function staticAccess(ids) {
+  const set = new Set(String(ids || '').split(/[,\s]+/).filter(Boolean));
+  return { has: id => set.has(String(id)), list: () => [...set], add: id => set.add(String(id)), linkCode: () => null };
+}
+
+function createBot({ token, allowedIds, access, dailyHour, publicUrl = '', core, call, log = console }) {
+  access ||= staticAccess(allowedIds);
+  const controller = new AbortController();
+  let timer = null;
   const hour = Number.isFinite(Number(dailyHour)) && String(dailyHour ?? '') !== '' ? Number(dailyHour) : 9;
   const S = core.STATUS_AR;
   const sessions = new Map(); // حالة "طلب جديد" لكل محادثة
@@ -67,7 +75,7 @@ function createBot({ token, allowedIds, dailyHour, publicUrl = '', core, call, l
 
   call ||= async (method, body) => {
     const r = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}),
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}), signal: controller.signal,
     });
     const j = await r.json();
     if (!j.ok) throw new Error(`${method}: ${j.description}`);
@@ -242,22 +250,28 @@ function createBot({ token, allowedIds, dailyHour, publicUrl = '', core, call, l
 
   // ---------- استقبال الرسائل ----------
   function authorizedChat(from, chat) {
-    if (allowed.has(String(from.id))) return true;
-    const msg = allowed.size
-      ? `⛔ البوت ده خاص. رقمك: <code>${from.id}</code>`
-      : `👋 أهلاً! رقم حسابك في تليجرام هو:\n\n<code>${from.id}</code>\n\nحطه في إعدادات السيستم في خانة <b>TELEGRAM_ALLOWED_IDS</b>، وبعدها البوت هيشتغل معاك.`;
+    if (access.has(String(from.id))) return true;
+    const msg = `⛔ البوت ده خاص.\n\nعشان تربطه بحسابك: افتح السيستم ← <b>الإعدادات</b> ← <b>ربط تليجرام</b>، ودوس على زرار الربط.`;
     call('sendMessage', { chat_id: chat, text: msg, parse_mode: 'HTML' }).catch(e => log.error(e.message));
     return false;
   }
 
   async function onMessage(m) {
     const chat = m.chat.id;
-    if (!m.from || !authorizedChat(m.from, chat)) return;
+    if (!m.from) return;
     const text = (m.text || '').trim();
     if (!text) return;
     const cmd = text.split(/\s+/)[0].replace(/@\w+$/, '').toLowerCase();
     const arg = text.slice(text.split(/\s+/)[0].length).trim();
     const s = sessions.get(chat);
+
+    // ربط الحساب باللينك اللي في صفحة الإعدادات: /start <كود>
+    const code = access.linkCode();
+    if (cmd === '/start' && arg && code && arg === code) {
+      access.add(String(m.from.id));
+      return say(chat, '✅ <b>تم ربط حسابك بالسيستم!</b>\n\n' + helpText());
+    }
+    if (!authorizedChat(m.from, chat)) return;
 
     if (cmd === '/cancel' || text === 'إلغاء' || text === 'الغاء') { sessions.delete(chat); return say(chat, '❌ اتلغت.'); }
     if (cmd === '/start' || cmd === '/help' || text === BTN.help) { sessions.delete(chat); return say(chat, helpText()); }
@@ -304,7 +318,7 @@ function createBot({ token, allowedIds, dailyHour, publicUrl = '', core, call, l
   async function onCallback(q) {
     const chat = q.message?.chat.id;
     const answer = (text = '') => call('answerCallbackQuery', { callback_query_id: q.id, text }).catch(() => {});
-    if (!q.from || !allowed.has(String(q.from.id))) return answer('⛔ غير مصرح');
+    if (!q.from || !access.has(String(q.from.id))) return answer('⛔ غير مصرح');
     const [kind, a, b] = String(q.data || '').split(':');
 
     if (kind === 'st') {
@@ -352,7 +366,7 @@ function createBot({ token, allowedIds, dailyHour, publicUrl = '', core, call, l
     const text = `☀️ <b>صباح الخير! تقرير ${fmtDate(t)}</b>\n\n` +
       `🔴 متأخر: <b>${d.counts.late || 0}</b> · 📅 قرب ميعاده: <b>${d.counts.due_soon || 0}</b> · 📦 مفتوح: ${d.counts.open || 0}\n\n` +
       lateText() + '\n\n' + soonText();
-    for (const id of allowed) await say(id, text).catch(e => log.error('Daily report:', e.message));
+    for (const id of access.list()) await say(id, text).catch(e => log.error('Daily report:', e.message));
     return true;
   }
 
@@ -362,6 +376,7 @@ function createBot({ token, allowedIds, dailyHour, publicUrl = '', core, call, l
         const updates = await call('getUpdates', { offset, timeout: 50, allowed_updates: ['message', 'callback_query'] });
         for (const u of updates) { offset = u.update_id + 1; await handleUpdate(u); }
       } catch (e) {
+        if (!running) break;
         log.error('Telegram polling:', e.message);
         await new Promise(r => setTimeout(r, 5000));
       }
@@ -377,11 +392,13 @@ function createBot({ token, allowedIds, dailyHour, publicUrl = '', core, call, l
       { command: 'customers', description: 'العملاء' }, { command: 'help', description: 'مساعدة' },
     ] }).catch(e => log.error('Telegram:', e.message));
     poll();
-    setInterval(() => dailyReport().catch(e => log.error(e.message)), 60 * 1000).unref();
-    log.log(`  بوت تليجرام: شغال ✔ (${allowed.size ? allowed.size + ' مستخدم مسموح' : 'ابعت للبوت رسالة عشان تعرف رقمك'})`);
+    timer = setInterval(() => dailyReport().catch(e => log.error(e.message)), 60 * 1000);
+    timer.unref?.();
+    log.log(`  بوت تليجرام: شغال ✔ (${access.list().length} حساب مربوط)`);
   }
+  function stop() { running = false; clearInterval(timer); controller.abort(); }
 
-  return { start, stop: () => { running = false; }, handleUpdate, dailyReport };
+  return { start, stop, handleUpdate, dailyReport };
 }
 
 module.exports = { createBot, parseItem, parseDate };
