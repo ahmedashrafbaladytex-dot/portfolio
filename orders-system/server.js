@@ -364,7 +364,9 @@ async function login(req, res) {
   const f = failures.get(ip) || { n: 0, until: 0 };
   if (f.until > Date.now()) throw new HttpError(429, 'محاولات كتير غلط. استنى ربع ساعة وجرب تاني.');
   const { password } = await readBody(req);
-  if (!authEnabled() || !checkPassword(password || '')) {
+  // لو اتنسخت معاها مسافات أو علامات تنصيص بالغلط
+  const cleaned = String(password || '').trim().replace(/^[`'"“”‘’«»]+|[`'"“”‘’«»]+$/g, '').trim();
+  if (!authEnabled() || !(checkPassword(password || '') || (cleaned && checkPassword(cleaned)))) {
     f.n++; if (f.n >= 10) { f.until = Date.now() + 15 * 60 * 1000; f.n = 0; }
     failures.set(ip, f);
     throw new HttpError(401, 'كلمة المرور غلط');

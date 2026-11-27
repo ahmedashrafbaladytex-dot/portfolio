@@ -81,6 +81,8 @@ test('password set from settings page protects the app', async () => {
   assert.equal((await call('dashboard')).status, 401, 'locked without cookie');
   assert.equal((await fetch(base + '/api/dashboard', { headers: { cookie } })).status, 200);
   assert.equal((await fetch(base + '/login', { method: 'POST', body: JSON.stringify({ password: 'wrong' }) })).status, 401);
+  const copied = await fetch(base + '/login', { method: 'POST', body: JSON.stringify({ password: ' `new-pass-1` ' }) });
+  assert.equal(copied.status, 200, 'stray backticks/spaces from copy-paste are ignored');
   const ok = await fetch(base + '/login', { method: 'POST', body: JSON.stringify({ password: 'new-pass-1' }) });
   assert.equal(ok.status, 200);
   const changed = await fetch(base + '/api/password', { method: 'POST', headers: { cookie }, body: JSON.stringify({ current: 'bad', password: 'xxxxxxx' }) });

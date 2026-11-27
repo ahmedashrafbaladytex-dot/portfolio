@@ -16,11 +16,15 @@
   <div class="logo">📦</div>
   <h1>نظام الطلبات</h1>
   <p>اكتب كلمة المرور عشان تدخل</p>
-  <input type="password" name="password" autocomplete="current-password" required autofocus placeholder="كلمة المرور">
+  <div style="position:relative">
+    <input type="password" name="password" id="pw" autocomplete="current-password" autocapitalize="off" autocorrect="off" spellcheck="false" required autofocus placeholder="كلمة المرور" style="direction:ltr">
+    <button type="button" id="eye" aria-label="إظهار كلمة المرور" style="position:absolute;left:8px;top:8px;border:none;background:none;font-size:20px;cursor:pointer">👁</button>
+  </div>
   <button class="btn primary">دخول</button>
   <div class="login-error" id="err" role="alert"></div>
 </form>
 <script>
+document.getElementById('eye').onclick = () => { const i = document.getElementById('pw'); i.type = i.type === 'password' ? 'text' : 'password'; i.focus(); };
 document.getElementById('f').addEventListener('submit', async e => {
   e.preventDefault();
   const err = document.getElementById('err');
