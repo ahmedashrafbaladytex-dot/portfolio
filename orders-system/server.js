@@ -73,10 +73,46 @@ CREATE TABLE IF NOT EXISTS order_log (
   at TEXT DEFAULT (datetime('now','localtime'))
 );
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS invoices (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT UNIQUE NOT NULL,
+  kind TEXT NOT NULL,                 -- sale: فاتورة مبيعات | return: فاتورة مرتجع
+  customer_id INTEGER NOT NULL REFERENCES customers(id),
+  invoice_date TEXT NOT NULL,
+  ref_number TEXT DEFAULT '',         -- الرقم المكتوب على الورقة
+  order_id INTEGER REFERENCES orders(id) ON DELETE SET NULL,
+  order_prev_status TEXT,             -- حالة الطلب قبل ما الفاتورة تعلّمه "تم التسليم" (عشان التراجع)
+  original_invoice_id INTEGER REFERENCES invoices(id) ON DELETE SET NULL,
+  notes TEXT DEFAULT '',
+  source TEXT DEFAULT 'web',
+  review_note TEXT DEFAULT '',
+  attachments TEXT DEFAULT '[]',
+  created_at TEXT DEFAULT (datetime('now','localtime'))
+);
+CREATE TABLE IF NOT EXISTS invoice_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  invoice_id INTEGER NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
+  product TEXT NOT NULL,
+  quantity REAL NOT NULL DEFAULT 1,
+  unit TEXT DEFAULT 'قطعة',
+  price REAL NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS tg_groups (chat_id TEXT PRIMARY KEY, kind TEXT NOT NULL, title TEXT DEFAULT '', created_at TEXT DEFAULT (datetime('now','localtime')));
+CREATE INDEX IF NOT EXISTS idx_invoices_customer ON invoices(customer_id);
+CREATE INDEX IF NOT EXISTS idx_invoice_items ON invoice_items(invoice_id);
 CREATE INDEX IF NOT EXISTS idx_orders_customer ON orders(customer_id);
 CREATE INDEX IF NOT EXISTS idx_orders_due ON orders(due_date);
 CREATE INDEX IF NOT EXISTS idx_items_order ON order_items(order_id);
 `);
+
+// أعمدة جديدة على جدول الطلبات (للقواعد القديمة)
+{
+  const cols = db.prepare('PRAGMA table_info(orders)').all().map(c => c.name);
+  for (const [name, def] of [['source', "TEXT DEFAULT 'web'"], ['review_note', "TEXT DEFAULT ''"], ['attachments', "TEXT DEFAULT '[]'"], ['ref_number', "TEXT DEFAULT ''"]])
+    if (!cols.includes(name)) db.exec(`ALTER TABLE orders ADD COLUMN ${name} ${def}`);
+}
+const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
+fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 const STATUSES = ['new', 'in_progress', 'ready', 'delivered', 'cancelled'];
 const STATUS_AR = { new: 'جديد', in_progress: 'قيد التنفيذ', ready: 'جاهز للتسليم', delivered: 'تم التسليم', cancelled: 'ملغي' };
@@ -129,8 +165,9 @@ function listOrders(q) {
   if (isDate(q.from)) { where.push('o.order_date >= :from'); p.from = q.from; }
   if (isDate(q.to)) { where.push('o.order_date <= :to'); p.to = q.to; }
   if (q.priority && PRIORITIES.includes(q.priority)) { where.push('o.priority = :pr'); p.pr = q.priority; }
+  if (q.review === '1') where.push("o.review_note <> ''");
   if (q.search) {
-    where.push(`(o.code LIKE :s OR c.name LIKE :s OR c.code LIKE :s OR c.phone LIKE :s OR o.notes LIKE :s
+    where.push(`(o.code LIKE :s OR c.name LIKE :s OR c.code LIKE :s OR c.phone LIKE :s OR o.notes LIKE :s OR o.ref_number LIKE :s
       OR EXISTS (SELECT 1 FROM order_items i WHERE i.order_id=o.id AND i.product LIKE :s))`);
     p.s = `%${str(q.search, 100)}%`;
   }
@@ -144,6 +181,8 @@ function getOrder(id) {
   if (!o) throw new HttpError(404, 'الطلب غير موجود');
   o.items = db.prepare('SELECT * FROM order_items WHERE order_id = ? ORDER BY id').all(o.id);
   o.log = db.prepare('SELECT * FROM order_log WHERE order_id = ? ORDER BY id DESC').all(o.id);
+  o.attachments = parseList(o.attachments);
+  o.invoices = db.prepare("SELECT id, code, kind, invoice_date FROM invoices WHERE order_id = ? ORDER BY id").all(o.id);
   return o;
 }
 
@@ -177,7 +216,9 @@ function createOrder(b) {
       v.status === 'delivered' ? today() : null);
     const id = Number(r.lastInsertRowid);
     for (const i of v.items) insertItem.run(id, i.product, i.quantity, i.unit, i.price);
-    addLog(id, `تم إنشاء الطلب (${STATUS_AR[v.status]})`);
+    db.prepare('UPDATE orders SET source=?, review_note=?, attachments=?, ref_number=? WHERE id=?')
+      .run(b.source === 'telegram' ? 'telegram' : 'web', str(b.review_note, 500), JSON.stringify(cleanList(b.attachments)), str(b.ref_number, 60), id);
+    addLog(id, `تم إنشاء الطلب (${STATUS_AR[v.status]})${b.source === 'telegram' ? ' من تليجرام' : ''}`);
     return getOrder(id);
   });
 }
@@ -213,6 +254,173 @@ function setStatus(id, status) {
   return getOrder(old.id);
 }
 
+function parseList(v) { try { const a = JSON.parse(v || '[]'); return Array.isArray(a) ? a : []; } catch { return []; } }
+const cleanList = v => (Array.isArray(v) ? v : []).filter(f => typeof f === 'string' && /^[\w-]+\.(jpg|jpeg|png|webp|pdf)$/.test(f)).slice(0, 10);
+
+function saveUpload(buffer, ext) {
+  const name = `${today()}-${crypto.randomBytes(8).toString('hex')}.${ext}`;
+  fs.writeFileSync(path.join(UPLOAD_DIR, name), buffer);
+  return name;
+}
+
+function clearReview(type, id) {
+  const table = type === 'order' ? 'orders' : 'invoices';
+  const r = db.prepare(`UPDATE ${table} SET review_note='' WHERE id=?`).run(Number(id));
+  if (!r.changes) throw new HttpError(404, 'غير موجود');
+  if (type === 'order') addLog(Number(id), 'تمت المراجعة');
+  return { ok: true };
+}
+
+function deleteOrder(id) {
+  const o = getOrder(id);
+  tx(() => {
+    db.prepare('UPDATE invoices SET order_id=NULL WHERE order_id=?').run(o.id);
+    db.prepare('DELETE FROM orders WHERE id=?').run(o.id);
+  });
+  return o;
+}
+
+// ---------- الفواتير والمرتجعات ----------
+const INVOICE_KINDS = ['sale', 'return'];
+const INVOICE_PREFIX = { sale: 'INV', return: 'RET' };
+const KIND_AR = { sale: 'فاتورة', return: 'مرتجع' };
+const INVOICE_SELECT = `
+SELECT v.*, c.name AS customer_name, c.code AS customer_code, c.phone AS customer_phone,
+  COALESCE((SELECT SUM(quantity*price) FROM invoice_items WHERE invoice_id=v.id),0) AS total,
+  COALESCE((SELECT SUM(quantity) FROM invoice_items WHERE invoice_id=v.id),0) AS total_qty,
+  (SELECT GROUP_CONCAT(product, '، ') FROM invoice_items WHERE invoice_id=v.id) AS products,
+  (SELECT code FROM orders WHERE id=v.order_id) AS order_code,
+  (SELECT code FROM invoices x WHERE x.id=v.original_invoice_id) AS original_code
+FROM invoices v JOIN customers c ON c.id = v.customer_id`;
+
+function listInvoices(q) {
+  const where = [], p = {};
+  if (INVOICE_KINDS.includes(q.kind)) { where.push('v.kind = :kind'); p.kind = q.kind; }
+  if (q.customer_id) { where.push('v.customer_id = :cid'); p.cid = Number(q.customer_id); }
+  if (isDate(q.from)) { where.push('v.invoice_date >= :from'); p.from = q.from; }
+  if (isDate(q.to)) { where.push('v.invoice_date <= :to'); p.to = q.to; }
+  if (q.review === '1') where.push("v.review_note <> ''");
+  if (q.search) {
+    where.push(`(v.code LIKE :s OR v.ref_number LIKE :s OR c.name LIKE :s OR c.code LIKE :s OR c.phone LIKE :s OR v.notes LIKE :s
+      OR EXISTS (SELECT 1 FROM invoice_items i WHERE i.invoice_id=v.id AND i.product LIKE :s))`);
+    p.s = `%${str(q.search, 100)}%`;
+  }
+  return db.prepare(`${INVOICE_SELECT} ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY v.id DESC LIMIT 2000`).all(p);
+}
+
+function getInvoice(id) {
+  const v = db.prepare(`${INVOICE_SELECT} WHERE v.id = :id`).get({ id: Number(id) });
+  if (!v) throw new HttpError(404, 'الفاتورة غير موجودة');
+  v.items = db.prepare('SELECT * FROM invoice_items WHERE invoice_id = ? ORDER BY id').all(v.id);
+  v.attachments = parseList(v.attachments);
+  v.returns = db.prepare('SELECT id, code, invoice_date FROM invoices WHERE original_invoice_id = ? ORDER BY id').all(v.id);
+  return v;
+}
+
+// بالكود (INV-2026-0001) أو بالرقم المكتوب على الورقة
+function findInvoice(ref, { kind, customerId } = {}) {
+  const r = str(ref, 60);
+  if (!r) return null;
+  const row = db.prepare(`SELECT id FROM invoices WHERE (code = :r COLLATE NOCASE OR ref_number = :r)
+    ${kind ? 'AND kind = :kind' : ''} ${customerId ? 'AND customer_id = :cid' : ''} ORDER BY id DESC LIMIT 1`)
+    .get({ r, ...(kind ? { kind } : {}), ...(customerId ? { cid: Number(customerId) } : {}) });
+  return row ? getInvoice(row.id) : null;
+}
+
+function validateInvoice(b, kindFallback) {
+  const kind = INVOICE_KINDS.includes(b.kind) ? b.kind : kindFallback;
+  if (!INVOICE_KINDS.includes(kind)) throw new HttpError(400, 'نوع الفاتورة غير صحيح');
+  const customer_id = Number(b.customer_id);
+  if (!customer_id || !db.prepare('SELECT 1 FROM customers WHERE id=?').get(customer_id)) throw new HttpError(400, 'اختر العميل');
+  if (!isDate(b.invoice_date)) throw new HttpError(400, 'تاريخ الفاتورة غير صحيح');
+  const items = (Array.isArray(b.items) ? b.items : [])
+    .map(i => ({ product: str(i.product, 200), quantity: num(i.quantity), unit: str(i.unit, 30) || 'قطعة', price: num(i.price) }))
+    .filter(i => i.product);
+  if (!items.length) throw new HttpError(400, 'أضف صنف واحد على الأقل');
+  if (items.some(i => i.quantity <= 0)) throw new HttpError(400, 'الكمية لازم تكون أكبر من صفر');
+  if (items.some(i => i.price < 0)) throw new HttpError(400, 'السعر لا يمكن أن يكون بالسالب');
+  let order_id = null, original_invoice_id = null;
+  if (kind === 'sale' && str(b.order_code)) {
+    const o = getOrderByCode(b.order_code);
+    if (!o) throw new HttpError(400, `مفيش طلب بالكود ${str(b.order_code, 40)}`);
+    if (o.customer_id !== customer_id) throw new HttpError(400, 'الطلب ده تبع عميل تاني');
+    order_id = o.id;
+  }
+  if (kind === 'return' && str(b.original_code)) {
+    const inv = findInvoice(b.original_code, { kind: 'sale' });
+    if (!inv) throw new HttpError(400, `مفيش فاتورة بالرقم ${str(b.original_code, 40)}`);
+    if (inv.customer_id !== customer_id) throw new HttpError(400, 'الفاتورة دي تبع عميل تاني');
+    original_invoice_id = inv.id;
+  }
+  return { kind, customer_id, invoice_date: b.invoice_date, ref_number: str(b.ref_number, 60), notes: str(b.notes, 2000), items, order_id, original_invoice_id };
+}
+
+const insertInvItem = db.prepare('INSERT INTO invoice_items (invoice_id, product, quantity, unit, price) VALUES (?,?,?,?,?)');
+
+// الفاتورة المربوطة بطلب بتعلّمه "تم التسليم"
+function linkOrderDelivered(orderId, invoiceCode) {
+  const o = getOrder(orderId);
+  if (['delivered', 'cancelled'].includes(o.status)) return null;
+  db.prepare(`UPDATE orders SET status='delivered', delivered_date=?, updated_at=datetime('now','localtime') WHERE id=?`).run(today(), o.id);
+  addLog(o.id, `الحالة: ${STATUS_AR[o.status]} ← ${STATUS_AR.delivered} (فاتورة ${invoiceCode})`);
+  return o.status;
+}
+
+function createInvoice(b, kindFallback) {
+  const v = validateInvoice(b, kindFallback);
+  return tx(() => {
+    const code = nextCode('invoices', `${INVOICE_PREFIX[v.kind]}-${v.invoice_date.slice(0, 4)}-`);
+    const r = db.prepare(`INSERT INTO invoices (code, kind, customer_id, invoice_date, ref_number, order_id, original_invoice_id, notes, source, review_note, attachments)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(code, v.kind, v.customer_id, v.invoice_date, v.ref_number, v.order_id, v.original_invoice_id, v.notes,
+      b.source === 'telegram' ? 'telegram' : 'web', str(b.review_note, 500), JSON.stringify(cleanList(b.attachments)));
+    const id = Number(r.lastInsertRowid);
+    for (const i of v.items) insertInvItem.run(id, i.product, i.quantity, i.unit, i.price);
+    if (v.order_id) {
+      const prev = linkOrderDelivered(v.order_id, code);
+      if (prev) db.prepare('UPDATE invoices SET order_prev_status=? WHERE id=?').run(prev, id);
+    }
+    return getInvoice(id);
+  });
+}
+
+function updateInvoice(id, b) {
+  const old = getInvoice(id);
+  const v = validateInvoice({ ...b, kind: old.kind });
+  return tx(() => {
+    db.prepare(`UPDATE invoices SET customer_id=?, invoice_date=?, ref_number=?, order_id=?, original_invoice_id=?, notes=? WHERE id=?`)
+      .run(v.customer_id, v.invoice_date, v.ref_number, v.order_id, v.original_invoice_id, v.notes, old.id);
+    db.prepare('DELETE FROM invoice_items WHERE invoice_id=?').run(old.id);
+    for (const i of v.items) insertInvItem.run(old.id, i.product, i.quantity, i.unit, i.price);
+    if (v.order_id && v.order_id !== old.order_id) {
+      const prev = linkOrderDelivered(v.order_id, old.code);
+      db.prepare('UPDATE invoices SET order_prev_status=? WHERE id=?').run(prev, old.id);
+    }
+    return getInvoice(old.id);
+  });
+}
+
+function deleteInvoice(id) {
+  const v = getInvoice(id);
+  tx(() => {
+    // لو الفاتورة هي اللي علّمت الطلب "تم التسليم"، نرجّعه لحالته
+    if (v.order_id && v.order_prev_status) {
+      const o = getOrder(v.order_id);
+      if (o.status === 'delivered') {
+        db.prepare(`UPDATE orders SET status=?, delivered_date=NULL, updated_at=datetime('now','localtime') WHERE id=?`).run(v.order_prev_status, o.id);
+        addLog(o.id, `الحالة: ${STATUS_AR.delivered} ← ${STATUS_AR[v.order_prev_status]} (اتلغت فاتورة ${v.code})`);
+      }
+    }
+    db.prepare('UPDATE invoices SET original_invoice_id=NULL WHERE original_invoice_id=?').run(v.id);
+    db.prepare('DELETE FROM invoices WHERE id=?').run(v.id);
+  });
+  return v;
+}
+
+function reviewList() {
+  return { orders: listOrders({ review: '1' }), invoices: listInvoices({ review: '1' }) };
+}
+const reviewCount = () => db.prepare("SELECT (SELECT COUNT(*) FROM orders WHERE review_note<>'') + (SELECT COUNT(*) FROM invoices WHERE review_note<>'') AS n").get().n;
+
 function getOrderByCode(code) {
   const row = db.prepare('SELECT id FROM orders WHERE code = ? COLLATE NOCASE').get(str(code, 40));
   return row ? getOrder(row.id) : null;
@@ -232,7 +440,13 @@ SELECT c.*,
      WHERE o.customer_id=c.id AND o.status<>'cancelled'),0) AS total_value,
   COALESCE((SELECT SUM(o.paid) FROM orders o WHERE o.customer_id=c.id AND o.status<>'cancelled'),0) AS total_paid,
   (SELECT GROUP_CONCAT(code, '، ') FROM (SELECT code FROM orders o WHERE o.customer_id=c.id ORDER BY o.id)) AS order_codes,
-  (SELECT MAX(order_date) FROM orders o WHERE o.customer_id=c.id) AS last_order
+  (SELECT MAX(order_date) FROM orders o WHERE o.customer_id=c.id) AS last_order,
+  (SELECT COUNT(*) FROM invoices v WHERE v.customer_id=c.id AND v.kind='sale') AS invoices_count,
+  (SELECT COUNT(*) FROM invoices v WHERE v.customer_id=c.id AND v.kind='return') AS returns_count,
+  COALESCE((SELECT SUM(i.quantity*i.price) FROM invoices v JOIN invoice_items i ON i.invoice_id=v.id WHERE v.customer_id=c.id AND v.kind='sale'),0) AS sales_total,
+  COALESCE((SELECT SUM(i.quantity*i.price) FROM invoices v JOIN invoice_items i ON i.invoice_id=v.id WHERE v.customer_id=c.id AND v.kind='return'),0) AS returns_total,
+  (SELECT GROUP_CONCAT(code, '، ') FROM (SELECT code FROM invoices v WHERE v.customer_id=c.id AND v.kind='sale' ORDER BY v.id)) AS invoice_codes,
+  (SELECT GROUP_CONCAT(code, '، ') FROM (SELECT code FROM invoices v WHERE v.customer_id=c.id AND v.kind='return' ORDER BY v.id)) AS return_codes
 FROM customers c`;
 
 function listCustomers(q) {
@@ -246,6 +460,8 @@ function getCustomer(id) {
   const c = db.prepare(`${CUSTOMER_STATS} WHERE c.id = :id`).get({ id: Number(id), today: today() });
   if (!c) throw new HttpError(404, 'العميل غير موجود');
   c.orders = listOrders({ customer_id: c.id });
+  c.invoices = listInvoices({ customer_id: c.id, kind: 'sale' });
+  c.returns = listInvoices({ customer_id: c.id, kind: 'return' });
   return c;
 }
 
@@ -287,7 +503,12 @@ function dashboard() {
   const soon = listOrders({ due_soon: '1' }).slice(0, 10);
   const topLate = db.prepare(`SELECT c.id, c.name, c.code, COUNT(*) AS n FROM orders o JOIN customers c ON c.id=o.customer_id
     WHERE ${OPEN} AND o.due_date < :today GROUP BY c.id ORDER BY n DESC LIMIT 5`).all(p);
+  const inv = one(`SELECT
+    COALESCE(SUM(CASE WHEN v.kind='sale' THEN i.quantity*i.price END),0) AS sales,
+    COALESCE(SUM(CASE WHEN v.kind='return' THEN i.quantity*i.price END),0) AS returns
+    FROM invoices v JOIN invoice_items i ON i.invoice_id=v.id WHERE v.invoice_date >= date(:today,'start of month')`);
   return { today: p.today, counts, byStatus, month_value: money.value, late, soon, topLate,
+    month_sales: inv.sales, month_returns: inv.returns, review: reviewCount(),
     customers: db.prepare('SELECT COUNT(*) AS n FROM customers').get().n };
 }
 
@@ -300,9 +521,15 @@ const ORDER_COLS = [['code', 'كود الطلب'], ['customer_code', 'كود ا�
   ['products', 'الأصناف'], ['total_qty', 'إجمالي الكمية'], ['total', 'القيمة'], ['paid', 'المدفوع'], [r => r.total - r.paid, 'المتبقي'],
   ['order_date', 'تاريخ الطلب'], ['due_date', 'موعد التسليم'], [r => STATUS_AR[r.status], 'الحالة'],
   [r => r.priority === 'urgent' ? 'عاجل' : 'عادي', 'الأولوية'], ['days_late', 'أيام التأخير'], ['delivered_date', 'تاريخ التسليم الفعلي'], ['notes', 'ملاحظات']];
+const INVOICE_COLS = [['code', 'الكود'], ['ref_number', 'رقم الورقة'], [r => KIND_AR[r.kind], 'النوع'], ['customer_code', 'كود العميل'],
+  ['customer_name', 'العميل'], ['products', 'الأصناف'], ['total_qty', 'إجمالي الكمية'], ['total', 'القيمة'], ['invoice_date', 'التاريخ'],
+  ['order_code', 'كود الطلب'], ['original_code', 'الفاتورة الأصلية'], ['notes', 'ملاحظات']];
 const CUSTOMER_COLS = [['code', 'كود العميل'], ['name', 'الاسم'], ['phone', 'التليفون'], ['address', 'العنوان'], ['orders_count', 'عدد الطلبات'],
   ['open_count', 'طلبات مفتوحة'], ['late_count', 'طلبات متأخرة'], ['delivered_count', 'تم تسليمها'], ['total_value', 'إجمالي القيمة'],
-  ['total_paid', 'إجمالي المدفوع'], [r => r.total_value - r.total_paid, 'المتبقي'], ['order_codes', 'أكواد الطلبات'], ['last_order', 'آخر طلب']];
+  ['total_paid', 'إجمالي المدفوع'], [r => r.total_value - r.total_paid, 'المتبقي'], ['order_codes', 'أكواد الطلبات'], ['last_order', 'آخر طلب'],
+  ['invoices_count', 'عدد الفواتير'], ['invoice_codes', 'أكواد الفواتير'], ['sales_total', 'إجمالي المبيعات'],
+  ['returns_count', 'عدد المرتجعات'], ['return_codes', 'أكواد المرتجعات'], ['returns_total', 'إجمالي المرتجعات'],
+  [r => r.sales_total - r.returns_total, 'صافي المبيعات']];
 
 // ---------- النسخ الاحتياطي ----------
 function backup() {
@@ -412,16 +639,44 @@ async function startBot() {
   if (!token) return;
   if (!tgAccess.linkCode()) setSetting('telegram_link_code', crypto.randomBytes(12).toString('hex'));
   try { tg.username = await tgGetMe(token); } catch (e) { tg.error = e.message; }
+  const { createIntake } = require('./intake');
+  const intake = createIntake({ core, aiConfig, extract: (...a) => require('./ai').extract(...a) });
   tg.bot = require('./bot').createBot({
-    token, access: tgAccess, core,
+    token, access: tgAccess, core, intake,
     dailyHour: process.env.DAILY_REPORT_HOUR,
     publicUrl: process.env.PUBLIC_URL || (process.env.RAILWAY_PUBLIC_DOMAIN ? 'https://' + process.env.RAILWAY_PUBLIC_DOMAIN : ''),
   });
   tg.bot.start();
 }
+// ---------- الذكاء الاصطناعي ----------
+const aiKey = () => getSetting('anthropic_api_key') || process.env.ANTHROPIC_API_KEY || '';
+const aiConfig = () => aiKey() ? { apiKey: aiKey(), quality: getSetting('ai_quality') || 'accurate' } : null;
+const aiLimit = () => Number(getSetting('ai_daily_limit')) || 200;
+const aiUsed = () => Number(getSetting('ai_count_' + today())) || 0;
+function aiQuota() {
+  if (aiUsed() >= aiLimit()) return false;
+  setSetting('ai_count_' + today(), aiUsed() + 1);
+  return true;
+}
+const aiStatus = () => ({ enabled: !!aiKey(), quality: getSetting('ai_quality') || 'accurate', used_today: aiUsed(), daily_limit: aiLimit() });
+
+// ---------- جروبات تليجرام ----------
+const GROUP_KINDS = ['orders', 'invoices', 'returns'];
+const groups = {
+  get: chatId => db.prepare('SELECT * FROM tg_groups WHERE chat_id=?').get(String(chatId)) || null,
+  set: (chatId, kind, title) => {
+    if (!GROUP_KINDS.includes(kind)) throw new HttpError(400, 'نوع غير صحيح');
+    db.prepare(`INSERT INTO tg_groups (chat_id, kind, title) VALUES (?,?,?)
+      ON CONFLICT(chat_id) DO UPDATE SET kind=excluded.kind, title=excluded.title`).run(String(chatId), kind, str(title, 120));
+  },
+  remove: chatId => db.prepare('DELETE FROM tg_groups WHERE chat_id=?').run(String(chatId)),
+  list: () => db.prepare('SELECT * FROM tg_groups ORDER BY created_at').all(),
+};
+
 function tgStatus() {
   const enabled = !!tgToken();
   return { enabled, from_env: enabled && !getSetting('telegram_token'), username: tg.username, error: tg.error, linked: tgIds().length,
+    groups: groups.list(),
     link: enabled && tg.username ? `https://t.me/${tg.username}?start=${tgAccess.linkCode()}` : '' };
 }
 
@@ -461,6 +716,8 @@ async function api(req, res, url) {
     if (id && m === 'DELETE') {
       const n = db.prepare('SELECT COUNT(*) AS n FROM orders WHERE customer_id=?').get(Number(id)).n;
       if (n) throw new HttpError(400, `لا يمكن حذف عميل عليه ${n} طلب. احذف طلباته أولاً.`);
+      const k = db.prepare('SELECT COUNT(*) AS n FROM invoices WHERE customer_id=?').get(Number(id)).n;
+      if (k) throw new HttpError(400, `لا يمكن حذف عميل عليه ${k} فاتورة/مرتجع. احذفها أولاً.`);
       db.prepare('DELETE FROM customers WHERE id=?').run(Number(id));
       return send(res, 200, { ok: true });
     }
@@ -472,11 +729,50 @@ async function api(req, res, url) {
     if (id && sub === 'status' && m === 'POST') return send(res, 200, setStatus(id, (await readBody(req)).status));
     if (id && !sub && m === 'GET') return send(res, 200, getOrder(id));
     if (id && !sub && m === 'PUT') return send(res, 200, updateOrder(id, await readBody(req)));
-    if (id && !sub && m === 'DELETE') { getOrder(id); db.prepare('DELETE FROM orders WHERE id=?').run(Number(id)); return send(res, 200, { ok: true }); }
+    if (id && !sub && m === 'DELETE') { deleteOrder(id); return send(res, 200, { ok: true }); }
+  }
+
+  if (res1 === 'invoices') {
+    if (!id && m === 'GET') return send(res, 200, listInvoices(q));
+    if (!id && m === 'POST') return send(res, 201, createInvoice(await readBody(req)));
+    if (id && m === 'GET') return send(res, 200, getInvoice(id));
+    if (id && m === 'PUT') return send(res, 200, updateInvoice(id, await readBody(req)));
+    if (id && m === 'DELETE') { deleteInvoice(id); return send(res, 200, { ok: true }); }
+  }
+
+  if (res1 === 'review') {
+    if (!id && m === 'GET') return send(res, 200, reviewList());
+    if (id && sub && m === 'POST') return send(res, 200, clearReview(id === 'order' ? 'order' : 'invoice', sub));
+  }
+
+  if (res1 === 'ai') {
+    if (!id && m === 'GET') return send(res, 200, aiStatus());
+    if (!id && m === 'POST') {
+      const b = await readBody(req);
+      if (b.key !== undefined) {
+        const key = str(b.key, 300).replace(/\s+/g, '');
+        if (!/^sk-ant-[\w-]{20,}$/.test(key)) throw new HttpError(400, 'شكل المفتاح غلط. لازم يبدأ بـ sk-ant-');
+        let ok;
+        try { ok = await require('./ai').checkKey(key); } catch { throw new HttpError(502, 'مش قادر أوصل لـ Anthropic دلوقتي. جرب تاني كمان شوية.'); }
+        if (!ok) throw new HttpError(400, 'المفتاح ده مش شغال. اتأكد إنك نسخته كامل.');
+        setSetting('anthropic_api_key', key);
+      }
+      if (['accurate', 'economy'].includes(b.quality)) setSetting('ai_quality', b.quality);
+      if (b.daily_limit !== undefined) setSetting('ai_daily_limit', Math.max(1, Math.min(5000, Math.round(num(b.daily_limit)) || 200)));
+      return send(res, 200, aiStatus());
+    }
+    if (!id && m === 'DELETE') { db.prepare("DELETE FROM settings WHERE key='anthropic_api_key'").run(); return send(res, 200, aiStatus()); }
+  }
+
+  if (res1 === 'telegram' && id === 'groups' && sub && m === 'DELETE') {
+    db.prepare('DELETE FROM tg_groups WHERE chat_id=?').run(String(sub));
+    return send(res, 200, tgStatus());
   }
 
   if (res1 === 'export' && m === 'GET') {
     const stamp = today();
+    if (id === 'invoices.csv') return send(res, 200, csv(listInvoices(q), INVOICE_COLS), 'text/csv; charset=utf-8',
+      { 'Content-Disposition': `attachment; filename="${q.kind === 'return' ? 'returns' : 'invoices'}-${stamp}.csv"` });
     if (id === 'orders.csv') return send(res, 200, csv(listOrders(q), ORDER_COLS), 'text/csv; charset=utf-8',
       { 'Content-Disposition': `attachment; filename="orders-${stamp}.csv"` });
     if (id === 'customers.csv') return send(res, 200, csv(listCustomers(q), CUSTOMER_COLS), 'text/csv; charset=utf-8',
@@ -502,6 +798,12 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === '/login.html' && (!authEnabled() || authorized(req))) return send(res, 302, '', 'text/plain', { Location: '/' });
     if (url.pathname.startsWith('/api/')) return await api(req, res, url);
+    if (url.pathname.startsWith('/uploads/')) {
+      const name = url.pathname.slice('/uploads/'.length);
+      if (!/^[\w-]+\.(jpg|jpeg|png|webp|pdf)$/.test(name) || !fs.existsSync(path.join(UPLOAD_DIR, name))) return send(res, 404, 'Not found', 'text/plain');
+      const type = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', pdf: 'application/pdf' }[name.split('.').pop()];
+      return send(res, 200, fs.readFileSync(path.join(UPLOAD_DIR, name)), type, { 'Cache-Control': 'private, max-age=86400' });
+    }
     let rel;
     try { rel = decodeURIComponent(url.pathname); } catch { return send(res, 400, 'Bad request', 'text/plain'); }
     if (rel === '/') rel = '/index.html';
@@ -544,8 +846,9 @@ server.listen(PORT, '0.0.0.0', () => {
   openBrowser();
 });
 
-const core = { listOrders, getOrder, getOrderByCode, createOrder, setStatus, listCustomers, getCustomer, saveCustomer, dashboard,
-  today, getSetting, setSetting, STATUS_AR };
+const core = { listOrders, getOrder, getOrderByCode, createOrder, setStatus, deleteOrder, listCustomers, getCustomer, saveCustomer, dashboard,
+  listInvoices, getInvoice, findInvoice, createInvoice, deleteInvoice, reviewCount, saveUpload, aiQuota, groups,
+  today, getSetting, setSetting, STATUS_AR, KIND_AR };
 
 if (!process.env.NO_BOT) startBot().catch(e => console.error('Telegram:', e.message));
 

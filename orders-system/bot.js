@@ -64,7 +64,7 @@ function staticAccess(ids) {
   return { has: id => set.has(String(id)), list: () => [...set], add: id => set.add(String(id)), linkCode: () => null };
 }
 
-function createBot({ token, allowedIds, access, dailyHour, publicUrl = '', core, call, log = console }) {
+function createBot({ token, allowedIds, access, dailyHour, publicUrl = '', core, call, download, intake, log = console }) {
   access ||= staticAccess(allowedIds);
   const controller = new AbortController();
   let timer = null;
@@ -81,6 +81,15 @@ function createBot({ token, allowedIds, access, dailyHour, publicUrl = '', core,
     if (!j.ok) throw new Error(`${method}: ${j.description}`);
     return j.result;
   };
+
+  download ||= async fileId => {
+    const f = await call('getFile', { file_id: fileId });
+    const r = await fetch(`https://api.telegram.org/file/bot${token}/${f.file_path}`, { signal: controller.signal });
+    if (!r.ok) throw new Error('download failed');
+    return Buffer.from(await r.arrayBuffer());
+  };
+  let me = null;
+  const getMe = async () => (me ||= await call('getMe', {}));
 
   const keyboard = { keyboard: [[{ text: BTN.late }, { text: BTN.soon }], [{ text: BTN.summary }, { text: BTN.new }], [{ text: BTN.customers }, { text: BTN.help }]], resize_keyboard: true, is_persistent: true };
 
@@ -136,8 +145,28 @@ function createBot({ token, allowedIds, access, dailyHour, publicUrl = '', core,
         lines.push(`${icon} <code>${h(o.code)}</code> — ${o.days_late > 0 ? `متأخر ${o.days_late} يوم` : S[o.status]} · /o${o.id}`);
       }
     }
+    if (c.invoices_count || c.returns_count) {
+      lines.push('', `🧾 الفواتير: <b>${c.invoices_count}</b> بقيمة ${n(c.sales_total)} ج · ↩️ المرتجعات: <b>${c.returns_count}</b> بقيمة ${n(c.returns_total)} ج`,
+        `📊 صافي المبيعات: <b>${n(c.sales_total - c.returns_total)}</b> ج`);
+      for (const v of [...(c.invoices || []), ...(c.returns || [])].sort((a, b) => a.id - b.id))
+        lines.push(`${v.kind === 'sale' ? '🧾' : '↩️'} <code>${h(v.code)}</code>${v.ref_number ? ` (ورقة ${h(v.ref_number)})` : ''} — ${n(v.total)} ج · ${fmtDate(v.invoice_date)} · /i${v.id}`);
+    }
     if (publicUrl) lines.push('', `🔗 ${publicUrl}/#/customers/${c.id}`);
     return lines.join('\n');
+  }
+
+  function invoiceText(v) {
+    const label = v.kind === 'sale' ? '🧾 فاتورة' : '↩️ مرتجع';
+    return [
+      `<b>${label} <code>${h(v.code)}</code></b>${v.ref_number ? ` · رقم الورقة: ${h(v.ref_number)}` : ''}`,
+      `👤 ${h(v.customer_name)} (<code>${h(v.customer_code)}</code>) · /c${v.customer_id}`,
+      `📅 ${fmtDate(v.invoice_date)}${v.order_code ? ` · الطلب: <code>${h(v.order_code)}</code> /o${v.order_id}` : ''}${v.original_code ? ` · الفاتورة الأصلية: <code>${h(v.original_code)}</code> /i${v.original_invoice_id}` : ''}`,
+      '', '<b>الأصناف:</b>',
+      ...v.items.map((i, k) => `${k + 1}. ${h(i.product)} — ${n(i.quantity)} ${h(i.unit)}${i.price ? ` × ${n(i.price)} = ${n(i.quantity * i.price)}` : ''}`),
+      '', `💰 الإجمالي: <b>${n(v.total)}</b> ج`,
+      v.review_note ? `\n⚠️ <b>محتاج مراجعة:</b> ${h(v.review_note)}` : '',
+      publicUrl ? `\n🔗 ${publicUrl}/#/invoices/${v.id}` : '',
+    ].filter(x => x !== '').join('\n');
   }
 
   function lateText() {
@@ -160,6 +189,8 @@ function createBot({ token, allowedIds, access, dailyHour, publicUrl = '', core,
       `➕ اتسجلت النهارده: ${c.created_today || 0} · 🟢 اتسلمت النهارده: ${c.delivered_today || 0}`,
       `🗓 طلبات الشهر ده: ${c.this_month || 0} · بقيمة ${n(d.month_value)} ج`,
       `👥 العملاء: ${d.customers}`,
+      d.month_sales || d.month_returns ? `🧾 مبيعات الشهر: ${n(d.month_sales)} ج · ↩️ مرتجعات: ${n(d.month_returns)} ج` : '',
+      d.review ? `⚠️ محتاج مراجعة: <b>${d.review}</b>${publicUrl ? ` · ${publicUrl}/#/review` : ''}` : '',
       d.topLate.length ? '\n<b>عملاء عندهم متأخر:</b>\n' + d.topLate.map(x => `• ${h(x.name)}: ${x.n} متأخر · /c${x.id}`).join('\n') : '',
     ].filter(x => x !== '').join('\n');
   }
@@ -259,6 +290,8 @@ function createBot({ token, allowedIds, access, dailyHour, publicUrl = '', core,
   async function onMessage(m) {
     const chat = m.chat.id;
     if (!m.from) return;
+    if (m.chat.type === 'group' || m.chat.type === 'supergroup') return onGroupMessage(m);
+    if (m.chat.type === 'channel') return;
     const text = (m.text || '').trim();
     if (!text) return;
     const cmd = text.split(/\s+/)[0].replace(/@\w+$/, '').toLowerCase();
@@ -284,6 +317,7 @@ function createBot({ token, allowedIds, access, dailyHour, publicUrl = '', core,
     let mm;
     if ((mm = cmd.match(/^\/o(\d+)$/))) return showOrder(chat, Number(mm[1]));
     if ((mm = cmd.match(/^\/c(\d+)$/))) return showCustomer(chat, Number(mm[1]));
+    if ((mm = cmd.match(/^\/i(\d+)$/))) return showInvoice(chat, Number(mm[1]));
     if (cmd === '/order' && arg) return searchText(chat, arg);
     if (cmd === '/customer' && arg) return searchText(chat, arg);
     if (cmd.startsWith('/')) return say(chat, 'أمر مش معروف. ' + BTN.help);
@@ -301,9 +335,18 @@ function createBot({ token, allowedIds, access, dailyHour, publicUrl = '', core,
     return say(chat, customerText(c));
   }
 
+  async function showInvoice(chat, id) {
+    let v; try { v = core.getInvoice(id); } catch { return say(chat, 'الفاتورة دي مش موجودة.'); }
+    return say(chat, invoiceText(v));
+  }
+
   async function searchText(chat, q) {
     q = arDigits(q).trim();
     const code = q.toUpperCase().replace(/\s+/g, '');
+    if (/^(INV|RET)-/.test(code)) {
+      const v = core.findInvoice(code);
+      return v ? say(chat, invoiceText(v)) : say(chat, `مفيش فاتورة بالكود ${h(code)}`);
+    }
     const o = core.getOrderByCode(code) || (/^\d{1,4}$/.test(code) ? core.getOrderByCode(`ORD-${core.today().slice(0, 4)}-${code.padStart(4, '0')}`) : null);
     if (o) return say(chat, orderText(o), { reply_markup: statusButtons(o) });
     const cs = core.listCustomers({ search: q });
@@ -315,11 +358,127 @@ function createBot({ token, allowedIds, access, dailyHour, publicUrl = '', core,
     return say(chat, `مش لاقي حاجة باسم "${h(q)}".\nجرب اسم العميل أو كوده، أو كود الطلب.`);
   }
 
+  // ---------- الجروبات: الطلبات / الفواتير / المرتجعات ----------
+  const GROUP_AR = { orders: '📦 الطلبات', invoices: '🧾 الفواتير', returns: '↩️ المرتجعات' };
+  const albums = new Map();
+  const reply = (m, text, extra = {}) => call('sendMessage', { chat_id: m.chat.id, text, parse_mode: 'HTML', disable_web_page_preview: true,
+    reply_parameters: { message_id: m.message_id, allow_sending_without_reply: true }, ...extra });
+
+  async function onGroupMessage(m) {
+    if (m.from.is_bot) return;
+    const chat = m.chat.id;
+    const bot = await getMe().catch(() => null);
+    if (bot && (m.new_chat_members || []).some(u => u.id === bot.id)) {
+      return call('sendMessage', { chat_id: chat, parse_mode: 'HTML', text:
+        '👋 أهلاً! عشان أشتغل في الجروب ده:\n\n1️⃣ خليني <b>أدمن</b> في الجروب (عشان أقدر أقرا الرسايل والصور).\n2️⃣ صاحب السيستم يكتب هنا <code>/setup</code> ويختار نوع الجروب.' });
+    }
+    const text = (m.text || '').trim();
+    const cmd = text.split(/\s+/)[0].replace(/@\w+$/, '').toLowerCase();
+    if (cmd === '/setup') {
+      if (!access.has(String(m.from.id))) return reply(m, '⛔ الأمر ده لصاحب السيستم بس. اربط حسابك الأول من صفحة الإعدادات.');
+      let warn = '';
+      try {
+        const member = await call('getChatMember', { chat_id: chat, user_id: bot.id });
+        if (member.status !== 'administrator') warn = '\n\n⚠️ <b>لسه مش أدمن</b>: من إعدادات الجروب خليني أدمن، وإلا مش هشوف الرسايل.';
+      } catch { /* ignore */ }
+      return reply(m, `الجروب ده هيستقبل إيه؟${warn}`, { reply_markup: { inline_keyboard: [
+        [{ text: GROUP_AR.orders, callback_data: 'setup:orders' }],
+        [{ text: GROUP_AR.invoices, callback_data: 'setup:invoices' }],
+        [{ text: GROUP_AR.returns, callback_data: 'setup:returns' }],
+        [{ text: '🚫 مش هيستقبل حاجة', callback_data: 'setup:off' }]] } });
+    }
+    const group = core.groups.get(chat);
+    if (!group || cmd.startsWith('/')) return;
+    if (m.media_group_id) {
+      const key = `${chat}:${m.media_group_id}`;
+      const a = albums.get(key) || { msgs: [] };
+      a.msgs.push(m);
+      clearTimeout(a.timer);
+      a.timer = setTimeout(() => { albums.delete(key); processGroup(group, a.msgs).catch(e => log.error('Group:', e.message)); }, 2500);
+      albums.set(key, a);
+      return;
+    }
+    return processGroup(group, [m]);
+  }
+
+  const IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+  async function processGroup(group, msgs) {
+    const first = msgs[0];
+    const text = msgs.map(x => x.text || '').filter(Boolean).join('\n');
+    const caption = msgs.map(x => x.caption || '').filter(Boolean).join('\n');
+    const files = [], attachments = [];
+    for (const x of msgs) {
+      let fileId = null, mediaType = null;
+      if (x.photo?.length) { fileId = x.photo.at(-1).file_id; mediaType = 'image/jpeg'; }
+      else if (x.document) {
+        const t = x.document.mime_type || '';
+        if (IMAGE_TYPES.includes(t) || t === 'application/pdf') { fileId = x.document.file_id; mediaType = t; }
+        else if (t.startsWith('image/')) return reply(first, '⚠️ نوع الصورة ده مش مدعوم. ابعتها كـ <b>صورة</b> عادية مش كملف.');
+        if (x.document.file_size > 15e6) return reply(first, '⚠️ الملف كبير جدًا (أكتر من 15 ميجا).');
+      }
+      if (!fileId) continue;
+      const data = await download(fileId);
+      files.push({ data, mediaType });
+      attachments.push(core.saveUpload(data, { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'png', 'application/pdf': 'pdf' }[mediaType]));
+    }
+    if (!text && !files.length) return;
+    call('sendChatAction', { chat_id: first.chat.id, action: 'typing' }).catch(() => {});
+    const r = await intake({ group: group.kind, text, caption, files, attachments });
+    if (r.status === 'ignored') return;
+    if (r.status === 'failed') return reply(first, '⚠️ ' + h(r.message));
+    const kindKey = r.entity === 'order' ? 'o' : 'i';
+    await reply(first, recordText(r), { reply_markup: { inline_keyboard: [[
+      { text: '↩️ تراجع (اتسجل غلط)', callback_data: `undo:${kindKey}:${r.record.id}:${first.from.id}` }]] } });
+    if (r.review.length) {
+      const note = `⚠️ <b>محتاج مراجعة</b> (من جروب ${GROUP_AR[group.kind]})\n\n` + recordText(r);
+      for (const id of access.list()) await say(id, note).catch(e => log.error('Notify:', e.message));
+    }
+  }
+
+  function recordText(r) {
+    const x = r.record;
+    const head = r.entity === 'order' ? `✅ <b>اتسجل طلب <code>${h(x.code)}</code></b>`
+      : `✅ <b>اتسجل ${r.kind === 'sale' ? 'فاتورة' : 'مرتجع'} <code>${h(x.code)}</code></b>${x.ref_number ? ` (رقم الورقة ${h(x.ref_number)})` : ''}`;
+    const lines = [head, `👤 ${h(x.customer_name)} (<code>${h(x.customer_code)}</code>)${r.newCustomer ? ' 🆕' : ''}`];
+    for (const [k, i] of x.items.entries()) lines.push(`${k + 1}. ${h(i.product)} — ${n(i.quantity)} ${h(i.unit)}${i.price ? ` × ${n(i.price)}` : ''}`);
+    if (x.total) lines.push(`💰 الإجمالي: <b>${n(x.total)}</b> ج`);
+    if (r.entity === 'order') lines.push(`📅 التسليم: ${fmtDate(x.due_date)}`);
+    else {
+      lines.push(`📅 ${fmtDate(x.invoice_date)}`);
+      if (x.order_code) lines.push(`🔗 مربوطة بالطلب <code>${h(x.order_code)}</code> (اتعلّم تم التسليم)`);
+      if (x.original_code) lines.push(`🔗 الفاتورة الأصلية <code>${h(x.original_code)}</code>`);
+    }
+    if (r.review.length) lines.push('', `⚠️ <b>محتاج مراجعة:</b> ${h(r.review.join(' • '))}`);
+    if (publicUrl) lines.push(`🔗 ${publicUrl}/#/${r.entity === 'order' ? 'orders' : 'invoices'}/${x.id}`);
+    return lines.join('\n');
+  }
+
   async function onCallback(q) {
     const chat = q.message?.chat.id;
     const answer = (text = '') => call('answerCallbackQuery', { callback_query_id: q.id, text }).catch(() => {});
-    if (!q.from || !access.has(String(q.from.id))) return answer('⛔ غير مصرح');
-    const [kind, a, b] = String(q.data || '').split(':');
+    if (!q.from) return answer();
+    const [kind, a, b, c] = String(q.data || '').split(':');
+    const edit = text => call('editMessageText', { chat_id: chat, message_id: q.message.message_id, text, parse_mode: 'HTML', disable_web_page_preview: true }).catch(() => {});
+
+    if (kind === 'setup') {
+      if (!access.has(String(q.from.id))) return answer('⛔ لصاحب السيستم بس');
+      if (a === 'off') { core.groups.remove(chat); await answer('✔'); return edit('🚫 الجروب ده مش هيستقبل حاجة.'); }
+      core.groups.set(chat, a, q.message.chat.title || '');
+      await answer('✔');
+      return edit(`✅ الجروب ده بقى جروب <b>${GROUP_AR[a]}</b>.\n\nأي رسالة أو صورة ورقة هتتبعت هنا هقراها وأسجلها في السيستم على طول، وأرد بالكود.`);
+    }
+    if (kind === 'undo') {
+      if (!access.has(String(q.from.id)) && String(q.from.id) !== c) return answer('⛔ اللي بعت الرسالة أو صاحب السيستم بس');
+      try {
+        const rec = a === 'o' ? core.getOrder(Number(b)) : core.getInvoice(Number(b));
+        if (rec.source !== 'telegram') return answer('ده اتعدل من السيستم، امسحه من هناك');
+        a === 'o' ? core.deleteOrder(rec.id) : core.deleteInvoice(rec.id);
+        await answer('✔ اتلغى');
+        return edit(`↩️ <s>${h(rec.code)}</s> اتلغى التسجيل. ابعت الرسالة تاني بشكل أوضح أو سجّلها يدوي.`);
+      } catch { await answer('اتلغى قبل كده'); return edit('↩️ اتلغى التسجيل.'); }
+    }
+
+    if (!access.has(String(q.from.id))) return answer('⛔ غير مصرح');
 
     if (kind === 'st') {
       try {
@@ -364,7 +523,8 @@ function createBot({ token, allowedIds, access, dailyHour, publicUrl = '', core,
     core.setSetting('daily_report_sent', t);
     const d = core.dashboard();
     const text = `☀️ <b>صباح الخير! تقرير ${fmtDate(t)}</b>\n\n` +
-      `🔴 متأخر: <b>${d.counts.late || 0}</b> · 📅 قرب ميعاده: <b>${d.counts.due_soon || 0}</b> · 📦 مفتوح: ${d.counts.open || 0}\n\n` +
+      `🔴 متأخر: <b>${d.counts.late || 0}</b> · 📅 قرب ميعاده: <b>${d.counts.due_soon || 0}</b> · 📦 مفتوح: ${d.counts.open || 0}\n` +
+      (d.review ? `⚠️ محتاج مراجعة: <b>${d.review}</b>\n` : '') + '\n' +
       lateText() + '\n\n' + soonText();
     for (const id of access.list()) await say(id, text).catch(e => log.error('Daily report:', e.message));
     return true;
