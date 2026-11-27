@@ -90,6 +90,7 @@ const r = run(store, cfg);
 const a = r.analysis;
 const strip = s => s.replace(/<[^>]+>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
 const msgs = [
+  ['ملخص الأسبوع', R.weeklyMessage(r.period(addDays(end, -6), end), a)],
   ['التقرير اليومي', R.dailyMessage(r.period(end, end), a)], ['الملخص', R.summaryMessage(a)], ['أقوى الأصناف', R.topMessage(a)],
   ['المرتجعات', R.returnsMessage(a)], ['ذوق السوق', R.tasteMessage(a)], ['الموديلات', R.modelsMessage(a)], ['التوقع والإنتاج', R.forecastMessage(a)],
   ['كارت صنف', R.itemMessage(a.items[0], a)],

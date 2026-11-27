@@ -44,7 +44,8 @@ function config() {
     allowedChats: (process.env.ALLOWED_CHATS || '').split(/[,\s]+/).filter(Boolean),
     reportChat: process.env.REPORT_CHAT || (process.env.ALLOWED_CHATS || '').split(/[,\s]+/).filter(Boolean)[0] || '',
     dailyTime: process.env.DAILY_REPORT_TIME || '21:00',
-    weeklyDay: num('WEEKLY_REPORT_DAY', 4), // 0 الأحد ... 4 الخميس
+    weeklyDay: num('WEEKLY_REPORT_DAY', 0), // 0 الأحد ... 4 الخميس
+    weeklyTime: process.env.WEEKLY_REPORT_TIME || '09:00',
     window: num('ANALYSIS_DAYS', 90),
     leadTimeDays: num('LEAD_TIME_DAYS', 14),
     coverDays: num('COVER_DAYS', 30),

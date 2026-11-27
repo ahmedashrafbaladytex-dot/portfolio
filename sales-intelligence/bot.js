@@ -16,6 +16,8 @@ const crypto = require('node:crypto');
 const readline = require('node:readline');
 const { loadSettings, saveSetting, config, run } = require('./src/engine');
 loadSettings();
+// الأجهزة اللي اتسطبت قبل كده كان التقرير الأسبوعي فيها الخميس بالليل: ننقله مرة واحدة للأحد 9 الصبح
+if (!process.env.WEEKLY_REPORT_TIME) { saveSetting('WEEKLY_REPORT_DAY', '0'); saveSetting('WEEKLY_REPORT_TIME', '09:00'); }
 const cfg = config();
 const store = require('./src/db').open(cfg.dataDir);
 const { TYPE_AR } = require('./src/db');
@@ -34,9 +36,9 @@ const LINK_CODE = String(crypto.randomInt(1000, 10000));     // كود ربط ا
 // ---------- القائمة (زراير ثابتة تحت الشات) ----------
 const B = {
   today: '📊 تقرير النهارده', plan: '🏭 خطة الإنتاج', items: '🏆 الأصناف', returns: '↩️ المرتجعات',
-  taste: '🎨 ذوق السوق والموديلات', full: '📁 التقرير الكامل', help: '❓ إزاي أستخدمه',
+  taste: '🎨 ذوق السوق والموديلات', full: '📁 التقرير الكامل', week: '🗓️ ملخص الأسبوع', help: '❓ إزاي أستخدمه',
 };
-const MENU = { keyboard: [[B.today, B.plan], [B.items, B.returns], [B.taste, B.full], [B.help]], resize_keyboard: true, is_persistent: true };
+const MENU = { keyboard: [[B.today, B.plan], [B.items, B.returns], [B.taste, B.full], [B.week, B.help]], resize_keyboard: true, is_persistent: true };
 
 const HELP = () => `🤖 <b>إزاي تستخدمني</b>
 
@@ -54,7 +56,7 @@ Excel أو CSV${ai.enabled() ? ' أو صورة الفاتورة' : ''} — وأ�
 ↩️ بعت ملف غلط؟ اكتب <code>الغي</code>
 📎 عايز نموذج ملف جاهز؟ اكتب <code>نماذج</code>
 
-وكل يوم الساعة ${cfg.dailyTime} هبعتلكم تقرير اليوم، وكل ${['أحد', 'اتنين', 'تلات', 'أربع', 'خميس', 'جمعة', 'سبت'][cfg.weeklyDay]} التقرير الكامل.`;
+وكل يوم الساعة ${cfg.dailyTime} هبعتلكم تقرير اليوم، وكل ${['أحد', 'اتنين', 'تلات', 'أربع', 'خميس', 'جمعة', 'سبت'][cfg.weeklyDay]} الساعة ${cfg.weeklyTime} ملخص الأسبوع (مبيعات ومخزون) والتقرير الكامل.`;
 
 // يفتح رابط في المتصفح/تليجرام على جهاز المستخدم
 function openUrl(url) {
@@ -249,11 +251,12 @@ const ACTIONS = {
   [B.returns]: c => send(c, R.returnsMessage(analysis().analysis)),
   [B.taste]: async c => { const a = analysis().analysis; await send(c, R.tasteMessage(a)); await send(c, R.modelsMessage(a)); },
   [B.full]: fullReport,
+  [B.week]: c => weeklyReport(c),
   [B.help]: c => send(c, HELP(), { reply_markup: MENU }),
 };
 const SLASH = {
   start: B.help, help: B.help, menu: B.help, today: B.today, forecast: B.plan, plan: B.plan, top: B.items, report: B.items,
-  returns: B.returns, taste: B.taste, models: B.taste, full: B.full, dashboard: B.full, excel: B.full, insights: B.full,
+  returns: B.returns, taste: B.taste, models: B.taste, full: B.full, week: B.week, weekly: B.week, dashboard: B.full, excel: B.full, insights: B.full,
 };
 
 async function onText(chatId, text) {
@@ -356,20 +359,22 @@ async function onCallback(q) {
 async function scheduler() {
   if (!cfg.reportChat) return;
   const d = today(), { hour, minute, weekday } = nowParts();
-  const [h, m] = cfg.dailyTime.split(':').map(Number);
-  if (hour * 60 + minute < h * 60 + (m || 0)) return;
-  if (store.getMeta('daily_sent') !== d) {
+  const passed = t => { const [h, m] = t.split(':').map(Number); return hour * 60 + minute >= h * 60 + (m || 0); };
+  if (weekday === cfg.weeklyDay && passed(cfg.weeklyTime) && store.getMeta('weekly_sent') !== d) {
+    store.setMeta('weekly_sent', d);
+    await weeklyReport(cfg.reportChat);
+  }
+  if (passed(cfg.dailyTime) && store.getMeta('daily_sent') !== d) {
     store.setMeta('daily_sent', d);
     await ACTIONS[B.today](cfg.reportChat);
   }
-  if (weekday === cfg.weeklyDay && store.getMeta('weekly_sent') !== d) {
-    store.setMeta('weekly_sent', d);
-    await send(cfg.reportChat, '🗓️ <b>التقرير الأسبوعي</b>');
-    await fullReport(cfg.reportChat);
-    const a = analysis().analysis;
-    await send(cfg.reportChat, R.forecastMessage(a));
-    await send(cfg.reportChat, R.modelsMessage(a));
-  }
+}
+
+// ملخص الأسبوع اللي فات (من الأحد للسبت) + اللوحة وملف Excel
+async function weeklyReport(c) {
+  const r = analysis(), d = today();
+  await send(c, R.weeklyMessage(r.period(addDays(d, -7), addDays(d, -1)), r.analysis));
+  await fullReport(c);
 }
 
 // ---------- التشغيل ----------

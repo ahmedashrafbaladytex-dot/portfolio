@@ -50,6 +50,49 @@ function dailyMessage(p, a) {
 }
 const topReason = i => Object.entries(i.reasons || {}).sort((a, b) => b[1] - a[1])[0]?.[0] || 'غير محدد';
 
+// ---------- ملخص الأسبوع (بيوصل كل أحد الصبح) ----------
+function weeklyMessage(p, a) {
+  const L = [`🗓️ <b>ملخص الأسبوع</b> (${p.from} ← ${p.to})`, ''];
+  const cmp = g => (g == null ? '' : `${arrow(g)} ${signedPct(g)} عن متوسط الأسابيع اللي فاتت`);
+  if (!p.sale_val && !p.ret_val && !p.ord_val) L.push('📭 مفيش فواتير ولا مرتجعات ولا طلبيات اتسجلت الأسبوع ده.');
+  else {
+    L.push('<b>💰 المبيعات</b>');
+    L.push(`المبيعات: <b>${money(p.sale_val)}</b> (${fmt(p.sale_qty)} قطعة، ${p.invoices} فاتورة، ${p.customers} عميل) ${p.sale_val ? cmp(p.vsAvg) : ''}`);
+    L.push(`المرتجعات: <b>${money(p.ret_val)}</b>${p.sale_val ? ` = ${pct(p.ret_val / p.sale_val)} من المبيعات` : ''}`);
+    L.push(`الصافي: <b>${money(p.sale_val - p.ret_val)}</b>`);
+    L.push(`الطلبيات الجديدة: ${money(p.ord_val)} (${p.orders} طلبية)`);
+    if (p.topItems.length) {
+      L.push('', '🏆 <b>الأكثر مبيعاً الأسبوع ده</b>');
+      p.topItems.forEach((t, i) => L.push(`${i + 1}. ${esc(t.name)} — ${fmt(t.qty)} قطعة`));
+    }
+    if (p.topReturns.length) {
+      L.push('', '↩️ <b>أكتر أصناف رجعت</b>');
+      p.topReturns.slice(0, 3).forEach(t => L.push(`• ${esc(t.name)} — ${fmt(t.qty)} قطعة`));
+    }
+  }
+  if (a) {
+    L.push('', '<b>📦 المخزون</b>');
+    const urgent = a.plan.filter(i => i.priority === 'urgent'), soon = a.plan.filter(i => i.priority === 'soon');
+    if (!urgent.length && !soon.length) L.push('✅ مفيش صنف هيخلص قريب.');
+    if (urgent.length) {
+      L.push(`🔴 <b>هيخلص قبل ما الإنتاج يلحق (${urgent.length})</b>`);
+      urgent.slice(0, 7).forEach(i => L.push(`• ${esc(i.name)} — ${i.stock > 0 ? `باقي ${fmt(i.stock)}، يكفي ${fmt(i.cover)} يوم` : 'خلص'} ← أنتج ${fmt(i.produce)}`));
+      if (urgent.length > 7) L.push(`  و${urgent.length - 7} صنف كمان في خطة الإنتاج`);
+    }
+    if (soon.length) {
+      L.push(`🟠 <b>محتاج يدخل الإنتاج قريب (${soon.length})</b>`);
+      soon.slice(0, 5).forEach(i => L.push(`• ${esc(i.name)} — باقي ${fmt(i.stock)} ← أنتج ${fmt(i.produce)}`));
+    }
+    if (a.overstock.length) {
+      const val = sum(a.overstock.map(i => (i.stock || 0) * (i.avg_price || 0)));
+      L.push(`🔵 <b>بضاعة واقفة (${a.overstock.length} صنف${val ? `، ≈ ${money(val)}` : ''})</b> — صرّفها بعرض`);
+      a.overstock.slice(0, 3).forEach(i => L.push(`• ${esc(i.name)} — ${fmt(i.stock)} قطعة`));
+    }
+  }
+  L.push('', '📁 اللوحة الكاملة وملف Excel تحت 👇');
+  return L.join('\n');
+}
+
 // ---------- ملخص الفترة ----------
 function summaryMessage(a) {
   const s = a.summary;
@@ -328,4 +371,4 @@ ${a.seasons.length ? `<h2>📅 مواسم جاية</h2><div class="grid2">${a.se
 </body></html>`;
 }
 
-module.exports = { dailyMessage, summaryMessage, topMessage, returnsMessage, tasteMessage, modelsMessage, forecastMessage, itemMessage, compactForAI, excelReport, dashboardHtml, money };
+module.exports = { dailyMessage, weeklyMessage, summaryMessage, topMessage, returnsMessage, tasteMessage, modelsMessage, forecastMessage, itemMessage, compactForAI, excelReport, dashboardHtml, money };
